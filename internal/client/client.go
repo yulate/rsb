@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,50 +68,139 @@ func Exec(host string, req *protocol.Request, stdin io.Reader, stdout, stderr io
 	}
 
 	// Read Output/Result/Error frames, copying to stdout/stderr.
-	exitCode := -1
-	for {
+	//
+	// Timeout design (fixes "exec hangs forever when daemon connection is
+	// dead"): the request's TimeoutMs is forwarded to the agent for process
+	// killing. Separately, the CLIENT enforces an inactivity deadline — if no
+	// frame arrives (not even Output) within the deadline, we treat the path
+	// as stuck and fail loudly instead of hanging forever.
+	//
+	//   - if req.TimeoutMs > 0:  client deadline = TimeoutMs + grace (so the
+	//     agent's Result has time to come back after it kills the process)
+	//   - if req.TimeoutMs == 0: an "inactivity" deadline — a long-running but
+	//     healthy command keeps sending Output, which resets the timer; only a
+	//     truly stuck path (dead daemon connection) times out. Default 60s,
+	//     configurable via RSB_INACTIVITY_TIMEOUT.
+	type frameOrErr struct {
+		f   *protocol.Frame
+		err error
+	}
+	frameCh := make(chan frameOrErr, 1)
+	go func() {
 		f, err := protocol.ReadFrame(conn)
-		if err != nil {
-			if err == io.EOF {
-				return ExecResult{ExitCode: 1}, errors.New("daemon closed connection without result")
-			}
-			return ExecResult{}, fmt.Errorf("read response: %w", err)
+		frameCh <- frameOrErr{f, err}
+	}()
+
+	clientDeadline := clientTimeout(req.TimeoutMs)
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	resetTimer := func() {
+		if timer != nil {
+			timer.Stop()
 		}
-		switch f.Kind {
-		case protocol.KindOutput:
-			var o protocol.Output
-			if err := unmarshal(f.Body, &o); err != nil {
-				continue
-			}
-			if o.Stream == "stdout" {
-				stdout.Write(o.Data)
-			} else {
-				stderr.Write(o.Data)
-			}
-		case protocol.KindResult:
-			var r protocol.Result
-			if err := unmarshal(f.Body, &r); err == nil {
-				exitCode = r.ExitCode
-			}
-			return ExecResult{ExitCode: exitCode}, nil
-		case protocol.KindError:
-			var e protocol.Error
-			if err := unmarshal(f.Body, &e); err == nil {
-				fmt.Fprintf(stderr, "rsb: agent error: %s\n", e.Reason)
-				// P11: a "nsenter ... Permission denied" on a --container request
-				// almost always means the remote agent is an OLD version that
-				// defaults to nsenter (pre-0.5.0). New agents default to docker
-				// exec. Hint the user to upgrade the agent.
-				if isStaleAgentContainerError(e.Reason) {
-					fmt.Fprint(stderr,
-						"rsb: this looks like a STALE remote agent (old versions default to nsenter).\n"+
-							"      fix: rsb ensure <host> --force   # upgrades the agent to docker-exec-default\n"+
-							"      workaround: rsb exec <host> --argv '[\"docker\",\"exec\",\"<container>\",\"cmd\"]'\n")
-				}
-			}
-			return ExecResult{ExitCode: 1}, nil
+		if clientDeadline > 0 {
+			timer = time.NewTimer(clientDeadline)
+			timerC = timer.C
 		}
 	}
+	resetTimer()
+
+	exitCode := -1
+	for {
+		select {
+		case <-timerC:
+			// No frame arrived within the deadline. This is the "stuck" case:
+			// either the daemon's host connection died (the original bug), or
+			// the user set --timeout and the agent didn't respond in time.
+			msg := "timed out"
+			if req.TimeoutMs > 0 {
+				msg = fmt.Sprintf("timed out after %dms (no response from agent)", req.TimeoutMs)
+			} else {
+				msg = fmt.Sprintf("no response within %v — the daemon's connection to the host may be dead; try `rsb daemon stop` then retry", clientDeadline)
+			}
+			return ExecResult{ExitCode: 124}, errors.New(msg)
+		case res := <-frameCh:
+			if res.err != nil {
+				if res.err == io.EOF {
+					return ExecResult{ExitCode: 1}, errors.New("daemon closed connection without result")
+				}
+				return ExecResult{}, fmt.Errorf("read response: %w", res.err)
+			}
+			// Any frame resets the inactivity timer (healthy commands stream
+			// Output continuously; only silence counts as "stuck").
+			resetTimer()
+			f := res.f
+			switch f.Kind {
+			case protocol.KindOutput:
+				var o protocol.Output
+				if err := unmarshal(f.Body, &o); err != nil {
+					continue
+				}
+				if o.Stream == "stdout" {
+					stdout.Write(o.Data)
+				} else {
+					stderr.Write(o.Data)
+				}
+				// Launch the next read for subsequent frames.
+				go func() {
+					nf, nerr := protocol.ReadFrame(conn)
+					frameCh <- frameOrErr{nf, nerr}
+				}()
+			case protocol.KindResult:
+				var r protocol.Result
+				if err := unmarshal(f.Body, &r); err == nil {
+					exitCode = r.ExitCode
+					// Normalize: agent reports timeout/kill as exit -1 with a
+					// signal. Map those to standard-ish exit codes so callers
+					// can distinguish failure modes. -1 raw would become 255
+					// via os.Exit, which is ambiguous.
+					if exitCode < 0 {
+						if r.Signal == "TIMEOUT" {
+							exitCode = 124 // conventional timeout exit code
+						} else {
+							exitCode = 137 // killed by signal (128+9 SIGKILL-ish)
+						}
+					}
+				}
+				return ExecResult{ExitCode: exitCode}, nil
+			case protocol.KindError:
+				var e protocol.Error
+				if err := unmarshal(f.Body, &e); err == nil {
+					fmt.Fprintf(stderr, "rsb: agent error: %s\n", e.Reason)
+					if isStaleAgentContainerError(e.Reason) {
+						fmt.Fprint(stderr,
+							"rsb: this looks like a STALE remote agent (old versions default to nsenter).\n"+
+								"      fix: rsb ensure <host> --force   # upgrades the agent to docker-exec-default\n"+
+								"      workaround: rsb exec <host> --argv '[\"docker\",\"exec\",\"<container>\",\"cmd\"]'\n")
+					}
+				}
+				return ExecResult{ExitCode: 1}, nil
+			}
+		}
+	}
+}
+
+// clientTimeout computes the client-side deadline for receiving the NEXT frame
+// (not the whole command). It's reset every time a frame arrives, so a healthy
+// long-running command that keeps streaming Output never trips it — only a
+// truly silent path (dead daemon connection) does.
+//
+//   - reqTimeoutMs > 0: deadline = reqTimeoutMs + 5s grace (so the agent's
+//     Result has time to come back after it kills the process at reqTimeoutMs)
+//   - reqTimeoutMs == 0: an inactivity deadline. Default 60s; override with
+//     RSB_INACTIVITY_TIMEOUT (seconds). Long commands stay alive as long as
+//     they keep producing output.
+func clientTimeout(reqTimeoutMs int) time.Duration {
+	if reqTimeoutMs > 0 {
+		return time.Duration(reqTimeoutMs)*time.Millisecond + 5*time.Second
+	}
+	secs := 60
+	if v := os.Getenv("RSB_INACTIVITY_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			secs = n
+		}
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // isStaleAgentContainerError detects the signature of an old (pre-0.5.0)

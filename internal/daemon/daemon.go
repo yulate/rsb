@@ -303,7 +303,13 @@ func (h *hostConn) pumpFromAgent() {
 			if !isClosedErr(err) && !errors.Is(err, io.EOF) {
 				log.Printf("agent[%s] read: %v", h.host, err)
 			}
+			// Tell any in-flight requests their connection is gone, then mark
+			// this hostConn closed so the pool rebuilds it on next use. WITHOUT
+			// this, a dead connection stays in the pool and every subsequent
+			// client hangs forever waiting for a reply that never comes.
 			h.failAll("agent connection closed")
+			h.close()
+			log.Printf("agent[%s] connection closed; will reconnect on next request", h.host)
 			return
 		}
 		// Route by request id for reply kinds.
@@ -341,7 +347,10 @@ func (h *hostConn) failAll(reason string) {
 
 // send enqueues a client frame for the agent. For Request/Stdin/EndStdin/Cancel
 // the frame already carries its id, which the agent uses to route replies.
-func (h *hostConn) send(f *protocol.Frame) bool {
+// The recover guards against the race where close() closes clientIn between
+// the isClosed() check and the send (which would panic on a closed channel).
+func (h *hostConn) send(f *protocol.Frame) (ok bool) {
+	defer func() { recover() }()
 	if h.isClosed() {
 		return false
 	}

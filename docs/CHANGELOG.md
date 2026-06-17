@@ -5,6 +5,23 @@
 
 ---
 
+## [0.5.1] - 2026-06-18
+
+修复 daemon 连接死亡时 exec 永久卡住的严重问题。
+
+### 修复
+- **P15** `rsb exec` 在 daemon 的 host 连接死亡时永久卡住，`--timeout` 无效（最严重）。三层修复：
+  - **client 端 inactivity timeout 兜底**：连续 N 秒收不到任何帧（连 Output 都没有）则判为卡死并失败。默认 60s，可用 `RSB_INACTIVITY_TIMEOUT` 环境变量调。健康的长命令（持续输出）不受影响——只有真正沉默的路径才超时。
+  - **daemon 死连接自动重建**：`pumpFromAgent` 读到 EOF 时自动 close 该 hostConn 并标记为死，下次请求自动建立新连接。用户无感知恢复。
+  - **send() 并发安全**：用 recover 防 close channel 与 send 的竞态 panic。
+- **P16** agent 端超时杀进程后退出码 -1（os.Exit 后变 255，语义模糊）→ client 规范化：TIMEOUT→124（标准 timeout 码），其他信号→137。
+
+### 变更
+- `--timeout` 现在同时作用于 client 端（clientTimeout = TimeoutMs + 5s grace），不再只传给 agent。
+- client 主循环重构为 goroutine + select，支持 inactivity deadline。
+
+---
+
 ## [0.5.0] - 2026-06-17
 
 第二批实战痛点修复：远端 agent 的可见性和强一致性。
