@@ -1,0 +1,6 @@
+# Local build output (root-level only; skill/bin/ is distributed WITH the skill)
+/bin/
+/dist/
+*.test
+*.out
+.DS_Store

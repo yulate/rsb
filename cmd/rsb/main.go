@@ -1,0 +1,921 @@
+// Command rsb is the local client for rsb (remote-shell-bridge).
+//
+// P1 architecture: rsb exec talks to a local daemon (auto-started if absent),
+// which keeps one SSH connection per host and multiplexes requests. This
+// gives connection reuse and session/cwd persistence across invocations.
+//
+// Subcommands:
+//
+//	rsb exec <host> --argv '<json>' [--cwd DIR] [--env K=V]... [--timeout MS] [--session NAME]
+//	rsb exec --local --argv '<json>' [...]        # same, but on this machine
+//	rsb daemon [start|stop|status]                # manage the local daemon
+//	rsb ensure <host>                             # install rsb-agent remotely
+//	rsb version
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"rsb/internal/client"
+	"rsb/internal/paths"
+	"rsb/internal/protocol"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		usage(os.Stderr)
+		os.Exit(2)
+	}
+	// Top-level help. Recognize -h/--help/help anywhere as the first arg, and
+	// also accept them after a subcommand (e.g. `rsb exec --help`).
+	switch os.Args[1] {
+	case "-h", "--help", "help":
+		usage(os.Stdout)
+		return
+	case "exec":
+		if wantsHelp(os.Args[2:]) {
+			helpExec()
+			return
+		}
+		cmdExec(os.Args[2:])
+	case "repl":
+		if wantsHelp(os.Args[2:]) {
+			helpRepl()
+			return
+		}
+		cmdRepl(os.Args[2:])
+	case "daemon":
+		if wantsHelp(os.Args[2:]) {
+			helpDaemon()
+			return
+		}
+		cmdDaemon(os.Args[2:])
+	case "ensure":
+		if wantsHelp(os.Args[2:]) {
+			helpEnsure()
+			return
+		}
+		cmdEnsure(os.Args[2:])
+	case "doctor":
+		if wantsHelp(os.Args[2:]) {
+			helpDoctor()
+			return
+		}
+		cmdDoctor(os.Args[2:])
+	case "install-local":
+		if wantsHelp(os.Args[2:]) {
+			helpInstallLocal()
+			return
+		}
+		cmdInstallLocal(os.Args[2:])
+	case "agent-version":
+		if wantsHelp(os.Args[2:]) {
+			helpAgentVersion()
+			return
+		}
+		cmdAgentVersion(os.Args[2:])
+	case "version", "-v", "--version":
+		fmt.Printf("rsb %s (protocol v%d)\n", version, protocol.ProtocolVersion)
+	default:
+		fmt.Fprintf(os.Stderr, "rsb: unknown command %q\n\n", os.Args[1])
+		usage(os.Stderr)
+		os.Exit(2)
+	}
+}
+
+// wantsHelp reports whether args contains a help flag (-h/--help/help).
+func wantsHelp(args []string) bool {
+	for _, a := range args {
+		switch a {
+		case "-h", "--help", "help":
+			return true
+		}
+	}
+	return false
+}
+
+// version is the rsb client version. Overridden at build time via ldflags
+// (-ldflags "-X main.version=..."); defaults to a dev marker.
+var version = "0.3.0-dev"
+
+// usage prints the top-level command summary. w is stdout for explicit help,
+// stderr for misuse (callers follow with a non-zero exit).
+func usage(w io.Writer) {
+	fmt.Fprint(w, `rsb `+version+` - remote shell bridge for agents
+
+Run commands on remote hosts or containers WITHOUT quoting hell: argv travels
+as a JSON array to execve on the target, never through a shell.
+
+USAGE
+  rsb <command> [options]
+
+COMMANDS
+  exec <host> --argv '<json>'   Execute a command (argv array, no shell)
+  repl <host>                   Interactive multi-command session
+  ensure <host> [--force]       Install/upgrade rsb-agent on a remote host
+  agent-version <host>          Show the agent version installed on a host
+  doctor [host]                 Self-check: home/binaries/daemon/ssh/docker
+  install-local                 Create bin/ symlinks for the current platform
+  daemon status|stop            Manage the local daemon (usually automatic)
+  version                       Print version
+
+GLOBAL OPTIONS
+  -h, --help                    Show help (use `+"`"+`rsb <command> --help`+"`"+` for per-command)
+
+QUICK START
+  rsb install-local                       # one-time: set up bin/ symlinks
+  rsb doctor                              # verify everything works
+  rsb exec --local --argv '["echo","hi"]' # run locally (no ssh)
+  rsb ensure prod-host                    # install agent on a remote host
+  rsb exec prod-host --argv '["ls","-la"]'
+
+EXAMPLE (the quoting-hell killer)
+  rsb exec prod --argv '["echo","he said \"hi\" and $HOME"]'
+  # argv is an array, so quotes/$ never get re-parsed by a shell
+
+MORE
+  rsb <command> --help    detailed options for each command
+  See skill/SKILL.md for the full agent guide.
+`)
+}
+
+// helpExec prints detailed help for `rsb exec`.
+func helpExec() {
+	fmt.Print(`rsb exec - run a command on a host or in a container
+
+USAGE
+  rsb exec <host> --argv '<json>' [options]
+  rsb exec --local --argv '<json>' [options]
+
+OPTIONS
+  --argv '<json>'     (required) JSON string array, e.g. '["ls","-la"]'
+  --cwd DIR           Working directory on the target
+  --env K=V           Environment variable (repeatable); values are NOT expanded
+  --timeout MS        Kill the command after N milliseconds
+  --session NAME      Share cwd/env across commands; "cd" persists per session
+  --container NAME    Run inside a Docker container (argv reaches it verbatim)
+  --stdin             Pipe local stdin to the remote command
+  --local             Run on this machine (no SSH); host is "local"
+
+EXIT CODE
+  rsb's exit code equals the remote command's exit code.
+
+EXAMPLES
+  rsb exec prod --argv '["grep","-rEn","TODO|FIXME","src/"]'
+  rsb exec prod --session work --argv '["cd","/app"]'
+  rsb exec prod --session work --argv '["pwd"]'            # still /app
+  rsb exec prod --container api --argv '["env"]'
+  cat file | rsb exec prod --stdin --argv '["docker","exec","-i","c","cat"]'
+`)
+}
+
+func helpRepl() {
+	fmt.Print(`rsb repl - interactive multi-command session (cwd persists)
+
+USAGE
+  rsb repl <host> [--session NAME]
+  rsb repl --local [--session NAME]
+
+INPUT FORMATS (one per line)
+  ["argv","as","json"]     explicit argv array (safe for any quoting)
+  some shell command       shorthand: wrapped as ["sh","-c","..."]
+
+IN-SESSION COMMANDS
+  :session NAME            switch/rename the active session
+  :container NAME          run subsequent commands in a container
+  :container               clear container (run on host again)
+  :quit                    exit
+
+EXAMPLE
+  rsb repl prod --session work
+  [prod:work] ["cd","/opt/app"]
+  [prod:work] ["ls"]
+  [prod:work] :container api
+  [prod:work/api] ["env"]
+  [prod:work/api] :quit
+`)
+}
+
+func helpEnsure() {
+	fmt.Print(`rsb ensure - install rsb-agent on a remote host
+
+USAGE
+  rsb ensure <host>
+
+Probes the remote OS/arch via ssh, then scp's the matching rsb-agent binary
+(located via the install home, not the cwd) to ~/.rsb/rsb-agent on the host.
+Run once per host before `+"`"+`rsb exec <host>`+"`"+`.
+
+EXAMPLE
+  rsb ensure ubuntu@1.2.3.4
+`)
+}
+
+func helpDoctor() {
+	fmt.Print(`rsb doctor - self-check the rsb installation
+
+USAGE
+  rsb doctor [host] [--container=NAME]
+
+CHECKS
+  install home              Where rsb finds its binaries
+  rsb/rsb-daemon/rsb-agent  Current-platform binaries present
+  daemon                    Running? (auto-starts on first exec otherwise)
+  ssh <host>                (if host given) reachable non-interactively?
+  remote agent version      (if host given) actual --version output on host
+  remote agent hash         (if host given) sha256 vs local — catches stale installs
+  docker                    Daemon reachable; local container mode
+  container exec <NAME>     (if --container given) REAL docker exec smoke test
+
+The --container test actually runs `+"`"+`docker exec <NAME> true`+"`"+`, so a passing
+check means `+"`"+`--container`+"`"+` will work, not just that docker is up.
+
+Exits non-zero if any required check fails.
+`)
+}
+
+func helpDaemon() {
+	fmt.Print(`rsb daemon - manage the local rsb daemon
+
+USAGE
+  rsb daemon status       Show daemon pid and socket
+  rsb daemon stop         Stop the daemon
+  rsb daemon start        (no-op; auto-starts on first exec)
+
+The daemon is normally fully automatic: the first `+"`"+`rsb exec`+"`"+` starts it
+and it keeps SSH connections open for reuse. You rarely need these commands.
+`)
+}
+
+func helpInstallLocal() {
+	fmt.Print(`rsb install-local - create convenient bin/ symlinks
+
+USAGE
+  rsb install-local
+
+Creates <home>/bin/rsb, <home>/bin/rsb-daemon, <home>/bin/rsb-agent as
+symlinks to the current platform's binaries, so you can add <home>/bin to
+PATH and call `+"`"+`rsb`+"`"+` directly instead of the platform-specific path.
+
+AFTER RUNNING
+  export PATH=<home>/bin:$PATH
+  rsb version
+`)
+}
+
+func helpAgentVersion() {
+	fmt.Print(`rsb agent-version - show the version of the agent installed on a host
+
+USAGE
+  rsb agent-version <host>
+  rsb agent-version --local
+
+Reports the remote rsb-agent's version, protocol version, and build time by
+running `+"`"+`rsb-agent --version`+"`"+` over ssh. Use this to verify a host actually runs
+the agent you think it does (and match it against `+"`"+`rsb version`+"`"+` locally).
+
+EXAMPLE
+  rsb version                  # local client version
+  rsb agent-version prod       # remote agent version — should match
+`)
+}
+
+// cmdRepl: rsb repl <host> [--session NAME] [--local]
+func cmdRepl(args []string) {
+	host := "local"
+	rest := args
+	if len(rest) > 0 && rest[0] == "--local" {
+		rest = rest[1:]
+	} else if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		host = rest[0]
+		rest = rest[1:]
+	}
+	var session string
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case "--session":
+			i++
+			if i < len(rest) {
+				session = rest[i]
+			}
+		default:
+			fatalf("unknown repl flag: %s", rest[i])
+		}
+	}
+	os.Exit(client.Repl(host, session, os.Stdin, os.Stdout, os.Stderr))
+}
+
+// cmdExec: rsb exec <host> --argv '...' [flags]
+func cmdExec(args []string) {
+	host := "local"
+	rest := args
+	// Allow "--local" as a leading flag shorthand for host=local.
+	if len(rest) > 0 && rest[0] == "--local" {
+		rest = rest[1:]
+	} else if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		host = rest[0]
+		rest = rest[1:]
+	}
+
+	var (
+		argvStr   string
+		cwd       string
+		envFlags  multiFlag
+		timeoutMs int
+		session   string
+		container string
+		stdinFlag bool
+	)
+	for i := 0; i < len(rest); i++ {
+		a := rest[i]
+		switch a {
+		case "--argv":
+			i++
+			if i < len(rest) {
+				argvStr = rest[i]
+			}
+		case "--cwd":
+			i++
+			if i < len(rest) {
+				cwd = rest[i]
+			}
+		case "--env":
+			i++
+			if i < len(rest) {
+				envFlags = append(envFlags, rest[i])
+			}
+		case "--timeout":
+			i++
+			if i < len(rest) {
+				timeoutMs, _ = strconv.Atoi(rest[i])
+			}
+		case "--session":
+			i++
+			if i < len(rest) {
+				session = rest[i]
+			}
+		case "--container":
+			i++
+			if i < len(rest) {
+				container = rest[i]
+			}
+		case "--stdin":
+			stdinFlag = true
+		default:
+			fatalf("unknown flag: %s", a)
+		}
+	}
+
+	if argvStr == "" {
+		fatalf("--argv is required (JSON array, e.g. '[\"echo\",\"hi\"]')")
+	}
+	var argv []string
+	if err := json.Unmarshal([]byte(argvStr), &argv); err != nil {
+		fatalf("invalid --argv JSON: %v", err)
+	}
+	if len(argv) == 0 {
+		fatalf("--argv is empty")
+	}
+	envMap := map[string]string{}
+	for _, kv := range envFlags {
+		j := strings.IndexByte(kv, '=')
+		if j < 0 {
+			fatalf("bad --env %q (want K=V)", kv)
+		}
+		envMap[kv[:j]] = kv[j+1:]
+	}
+
+	req := &protocol.Request{
+		ID:        newID(),
+		Type:      "exec",
+		Argv:      argv,
+		Cwd:       cwd,
+		Env:       envMap,
+		TimeoutMs: timeoutMs,
+		Session:   session,
+		Container: container,
+	}
+
+	var stdin io.Reader
+	if stdinFlag {
+		stdin = os.Stdin
+	}
+	res, err := client.Exec(host, req, stdin, os.Stdout, os.Stderr)
+	if err != nil {
+		fatalf("%v", err)
+	}
+	os.Exit(res.ExitCode)
+}
+
+// cmdDaemon: rsb daemon [start|stop|status]
+func cmdDaemon(args []string) {
+	action := "status"
+	if len(args) > 0 {
+		action = args[0]
+	}
+	switch action {
+	case "start":
+		// Touching the daemon is normally automatic; explicit start is for
+		// debugging. We just dial, which auto-starts if needed.
+		if pid := readPID(); pid > 0 && processAlive(pid) {
+			fmt.Fprintf(os.Stderr, "rsb: daemon already running pid=%d\n", pid)
+			return
+		}
+		// Force a dial to bootstrap.
+		fmt.Fprintln(os.Stderr, "rsb: (daemon auto-starts on next exec; no manual start needed)")
+	case "stop":
+		pid := readPID()
+		if pid <= 0 {
+			fmt.Fprintln(os.Stderr, "rsb: no daemon running")
+			return
+		}
+		if err := killPID(pid); err != nil {
+			fatalf("stop: %v", err)
+		}
+		os.Remove(paths.PIDFile())
+		fmt.Fprintf(os.Stderr, "rsb: daemon pid=%d stopped\n", pid)
+	case "status":
+		pid := readPID()
+		if pid > 0 && processAlive(pid) {
+			sock := paths.SocketPath()
+			fmt.Fprintf(os.Stderr, "rsb: daemon running pid=%d socket=%s\n", pid, sock)
+		} else {
+			fmt.Fprintln(os.Stderr, "rsb: daemon not running")
+		}
+	default:
+		fatalf("unknown daemon action: %s (use start|stop|status)", action)
+	}
+}
+
+// cmdEnsure: rsb ensure <host> [--force] — install a platform-matching
+// rsb-agent to ~/.rsb/ on the host.
+//
+// Reliability contract (fixes P8/P12): the install is atomic AND verified.
+//   - Upload to a temp path (~/.rsb/.rsb-agent.new), not the final path, so a
+//     failed scp never leaves a half-written agent.
+//   - chmod + atomic mv (rename) into place. rename is atomic on POSIX.
+//   - SHA256 of local vs remote: must match or we FAIL loudly. This is the
+//     guard against the "looks installed but it's stale" trap.
+//
+// Without --force, if the remote hash already matches we skip the upload
+// entirely (idempotent). With --force we always re-upload and re-verify.
+func cmdEnsure(args []string) {
+	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
+		fatalf("usage: rsb ensure <host> [--force]")
+	}
+	host := args[0]
+	force := false
+	for _, a := range args[1:] {
+		switch a {
+		case "--force":
+			force = true
+		default:
+			fatalf("unknown ensure flag: %s", a)
+		}
+	}
+
+	remoteOS, remoteArch, err := probeRemoteArch(host)
+	if err != nil {
+		fatalf("probe %s: %v\nhint: ensure the host is reachable via ssh", host, err)
+	}
+	fmt.Fprintf(os.Stderr, "rsb: %s is %s/%s\n", host, remoteOS, remoteArch)
+
+	localBin := paths.AgentForPlatform(remoteOS, remoteArch)
+	if localBin == "" {
+		home := paths.Home()
+		fatalf("no rsb-agent for %s/%s found under rsb home %q\n"+
+			"  expected: %s/bin/%s-%s/rsb-agent\n"+
+			"fix: run from the rsb install dir, or set RSB_HOME, or rebuild:\n"+
+			"  RSB_HOME=<path-to-rsb-skill> rsb ensure %s\n"+
+			"  bash <home>/scripts/build.sh",
+			remoteOS, remoteArch, home, home, remoteOS, remoteArch, host)
+	}
+
+	// Compute the local agent's sha256 up front; we'll compare the remote to it.
+	localHash, err := sha256File(localBin)
+	if err != nil {
+		fatalf("hash local agent: %v", err)
+	}
+
+	remotePath := paths.RemoteAgentPath
+	tmpRemote := remotePath + ".new"
+
+	// Idempotent fast path: if not --force and the remote hash already matches,
+	// skip the upload. This makes repeated `ensure` cheap and safe.
+	if !force {
+		if remoteHash, ok := remoteSHA256(host, remotePath); ok {
+			if remoteHash == localHash {
+				fmt.Fprintf(os.Stderr, "rsb: %s agent already up to date (%.12s)\n", host, localHash)
+				return
+			}
+			fmt.Fprintf(os.Stderr, "rsb: %s agent is stale (%.12s -> %s), updating\n",
+				host, remoteHash, localHash[:12])
+		}
+	}
+
+	// Upload to a temp path, chmod, then atomic mv into place. A failed scp
+	// leaves only the .new file, never touching the live agent.
+	fmt.Fprintf(os.Stderr, "rsb: installing %s -> %s:%s\n", localBin, host, remotePath)
+	steps := [][]string{
+		{"ssh", host, "mkdir -p ~/.rsb"},
+		{"scp", localBin, host + ":" + tmpRemote},
+		{"ssh", host, "chmod +x " + tmpRemote},
+		// mv is atomic on POSIX: at no instant does a half-installed agent exist.
+		{"ssh", host, "mv -f " + tmpRemote + " " + remotePath},
+	}
+	for _, c := range steps {
+		cmd := exec.Command(c[0], c[1:]...)
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			// Clean up the temp file so the next run isn't confused by it.
+			exec.Command("ssh", host, "rm -f "+tmpRemote).Run()
+			fatalf("%s: %v", c[0], err)
+		}
+	}
+
+	// Verify: hash the freshly-installed remote agent and compare. This is the
+	// critical guard — it catches truncation, partial scp, wrong-platform
+	// binaries, and any silent failure that "looked" successful.
+	remoteHash, ok := remoteSHA256(host, remotePath)
+	if !ok {
+		fatalf("installed but could not hash remote agent — verification FAILED\n"+
+			"the agent may be corrupt; retry: rsb ensure %s --force", host)
+	}
+	if remoteHash != localHash {
+		fatalf("verification FAILED: remote agent sha256 mismatch\n"+
+			"  local:  %s\n  remote: %s\n"+
+			"the remote agent is NOT what we uploaded. retry: rsb ensure %s --force",
+			localHash, remoteHash, host)
+	}
+	fmt.Fprintf(os.Stderr, "rsb: %s ready (verified sha256 %.12s)\n", host, localHash)
+}
+
+// sha256File returns the hex sha256 of a local file.
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// remoteSHA256 runs `sha256sum` (or `shasum -a 256` fallback) on the host and
+// returns the hex hash. ok=false if the file is missing or the command failed.
+func remoteSHA256(host, path string) (hash string, ok bool) {
+	// Try sha256sum first (Linux), fall back to shasum (macOS/BSD).
+	for _, cmd := range []string{"sha256sum " + path, "shasum -a 256 " + path} {
+		out, err := exec.Command("ssh", host, cmd).Output()
+		if err != nil {
+			continue
+		}
+		// Both commands print "<hash>  <path>" or "<hash>  <path>"; first field.
+		fields := strings.Fields(string(out))
+		if len(fields) > 0 && len(fields[0]) == 64 {
+			return fields[0], true
+		}
+	}
+	return "", false
+}
+
+// cmdAgentVersion: rsb agent-version <host> — runs `rsb-agent --version` on the
+// remote host over ssh and prints its version/protocol/build-time. This is the
+// reliable way to answer "did ensure actually update the agent?" without
+// guessing from behavior (pain point #10).
+func cmdAgentVersion(args []string) {
+	host := "local"
+	rest := args
+	if len(rest) > 0 && rest[0] == "--local" {
+		rest = rest[1:]
+	} else if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		host = rest[0]
+		rest = rest[1:]
+	}
+
+	// Resolve the agent binary path on the target. Remote: the install path.
+	// Local: via home discovery so it works from any cwd.
+	agentBin := paths.RemoteAgentPath
+	if host == "local" {
+		if dir, err := paths.LocalPlatformDir(); err == nil {
+			agentBin = dir + "/rsb-agent"
+		} else {
+			fatalf("cannot find local agent: %v", err)
+		}
+	}
+
+	var out []byte
+	var err error
+	if host == "local" {
+		out, err = exec.Command(agentBin, "--version").Output()
+	} else {
+		out, err = exec.Command("ssh", host, agentBin+" --version").Output()
+	}
+	if err != nil {
+		// Distinguish "agent not installed" from other failures.
+		stderr := ""
+		if ee, ok := err.(*exec.ExitError); ok {
+			stderr = string(ee.Stderr)
+		}
+		fmt.Fprintf(os.Stderr, "rsb: cannot get agent version on %s: %v\n", host, err)
+		if strings.Contains(stderr, "No such file") || strings.Contains(stderr, "not found") {
+			fmt.Fprintf(os.Stderr, "rsb: agent is not installed; run: rsb ensure %s\n", host)
+		}
+		os.Exit(1)
+	}
+	ver := strings.TrimSpace(string(out))
+	if host == "local" {
+		fmt.Printf("local:   %s\n", ver)
+		fmt.Printf("client:  rsb %s (protocol v%d)\n", version, protocol.ProtocolVersion)
+	} else {
+		fmt.Printf("%s: %s\n", host, ver)
+		fmt.Printf("client:  rsb %s (protocol v%d)\n", version, protocol.ProtocolVersion)
+	}
+}
+
+// cmdDoctor runs a self-check: home discovery, this-platform binaries, the
+// cmdDoctor runs a self-check: home discovery, this-platform binaries, the
+// daemon, optional SSH host reachability + remote agent version/hash, and
+// docker access with an optional real container smoke test. Exits non-zero
+// if any check fails.
+//
+// Usage: rsb doctor [host] [--container NAME]
+//   host       : if given, also checks SSH reachability, remote agent
+//                version+hash (vs local), and remote container mode.
+//   --container: if given, runs a REAL `docker exec <NAME> true` smoke test
+//                instead of just checking daemon connectivity. This catches
+//                the "doctor says ok but --container actually fails" trap.
+func cmdDoctor(args []string) {
+	host := ""
+	testContainer := ""
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--local":
+			host = "local"
+		case strings.HasPrefix(a, "--container="):
+			testContainer = strings.TrimPrefix(a, "--container=")
+		case a == "--container":
+			if i+1 >= len(args) {
+				fatalf("usage: rsb doctor [host] [--container NAME]")
+			}
+			i++
+			testContainer = args[i]
+		case !strings.HasPrefix(a, "-"):
+			host = a
+		}
+	}
+	ok := true
+	report := func(label, status, detail string) {
+		mark := "ok"
+		if status != "ok" {
+			mark = status
+			ok = false
+		}
+		if detail != "" {
+			fmt.Fprintf(os.Stderr, "  %-30s %-10s %s\n", label+":", mark, detail)
+		} else {
+			fmt.Fprintf(os.Stderr, "  %-30s %s\n", label+":", mark)
+		}
+	}
+	info := func(label, detail string) {
+		fmt.Fprintf(os.Stderr, "  %-30s %s\n", label+":", detail)
+	}
+
+	fmt.Fprintf(os.Stderr, "rsb %s doctor\n", version)
+
+	// 1. Install home discovery.
+	home := paths.Home()
+	if home == "" {
+		report("install home", "FAIL", "not found (set RSB_HOME or run from install dir)")
+	} else {
+		report("install home", "ok", home)
+	}
+
+	// 2. This-platform binaries.
+	if dir, err := paths.LocalPlatformDir(); err == nil {
+		for _, bin := range []string{"rsb", "rsb-daemon", "rsb-agent"} {
+			p := dir + "/" + bin
+			if st, err := os.Stat(p); err == nil && !st.IsDir() {
+				report(bin, "ok", p)
+			} else {
+				report(bin, "missing", "expected at "+p)
+			}
+		}
+	} else {
+		report("platform binaries", "FAIL", err.Error())
+	}
+
+	// 3. Daemon status (informational, not a failure if down).
+	pid := readPID()
+	if pid > 0 && processAlive(pid) {
+		report("daemon", "ok", fmt.Sprintf("pid=%d socket=%s", pid, paths.SocketPath()))
+	} else {
+		info("daemon", "not running (auto-starts on first exec)")
+	}
+
+	// 4. Remote host checks: reachability, agent version + hash, container mode.
+	if host != "" && host != "local" {
+		out, err := exec.Command("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+			host, "echo rsb-ssh-ok").Output()
+		if err != nil {
+			report("ssh "+host, "FAIL",
+				"cannot connect non-interactively (key/agent needed)")
+		} else if strings.TrimSpace(string(out)) == "rsb-ssh-ok" {
+			report("ssh "+host, "ok", "reachable")
+
+			// Remote agent present?
+			if _, err := exec.Command("ssh", host, "test -x "+paths.RemoteAgentPath).CombinedOutput(); err != nil {
+				report("remote agent", "missing", "run: rsb ensure "+host)
+			} else {
+				// Remote agent version (P10): the key check — is it the version
+				// we think it is?
+				rVer, _ := exec.Command("ssh", host, paths.RemoteAgentPath+" --version").Output()
+				report("remote agent version", "ok", strings.TrimSpace(string(rVer)))
+
+				// Remote agent hash vs local (P8/P10): catches stale installs.
+				remoteOS, remoteArch, _ := probeRemoteArch(host)
+				localBin := paths.AgentForPlatform(remoteOS, remoteArch)
+				if localBin != "" {
+					localHash, _ := sha256File(localBin)
+					remoteHash, rhok := remoteSHA256(host, paths.RemoteAgentPath)
+					if rhok && remoteHash == localHash {
+						report("remote agent hash", "ok",
+							fmt.Sprintf("%.12s (matches local)", localHash))
+					} else if rhok {
+						report("remote agent hash", "STALE",
+							fmt.Sprintf("remote %.12s != local %.12s; fix: rsb ensure %s --force",
+								remoteHash, localHash, host))
+					}
+				}
+			}
+		}
+	}
+
+	// 5. Docker access + container mode. P9: if --container given, run a REAL
+	// smoke test (`docker exec <container> true`) so "doctor says ok" actually
+	// means "--container will work", not just "docker daemon is up".
+	localMode := "docker exec (default)"
+	if strings.ToLower(os.Getenv("RSB_CONTAINER_MODE")) == "nsenter" {
+		localMode = "nsenter (RSB_CONTAINER_MODE)"
+	}
+	if testContainer != "" && host != "" && host != "local" {
+		if err := exec.Command("ssh", host, "docker", "exec", testContainer, "true").Run(); err != nil {
+			report("container exec "+testContainer, "FAIL",
+				"remote docker exec failed; "+strings.TrimSpace(err.Error())+
+					"\n      fix: rsb ensure "+host+" --force, or use argv form: rsb exec "+host+" --argv '[\"docker\",\"exec\",\""+testContainer+"\",\"cmd\"]'")
+		} else {
+			report("container exec "+testContainer, "ok",
+				"remote smoke test passed; local mode: "+localMode)
+		}
+	} else if _, err := exec.LookPath("docker"); err != nil {
+		info("docker", "absent (container features unavailable)")
+	} else if out, err := exec.Command("docker", "info").CombinedOutput(); err != nil {
+		low := strings.ToLower(string(out))
+		if strings.Contains(low, "permission denied") || strings.Contains(low, "docker.sock") {
+			user := os.Getenv("USER")
+			if user == "" {
+				user = "<user>"
+			}
+			report("docker", "FAIL", "socket permission denied; fix: sudo usermod -aG docker "+user)
+		} else {
+			report("docker", "FAIL", "daemon not reachable")
+		}
+	} else if testContainer != "" {
+		// REAL container smoke test: actually exec into the named container.
+		// This is what distinguishes "docker daemon up" from "--container works".
+		if err := exec.Command("docker", "exec", testContainer, "true").Run(); err != nil {
+			report("container exec "+testContainer, "FAIL",
+				"docker exec failed; "+strings.TrimSpace(err.Error())+
+					"\n      fix: rsb ensure <host> --force, or use argv form: rsb exec <host> --argv '[\"docker\",\"exec\",\""+testContainer+"\",\"cmd\"]'")
+		} else {
+			report("container exec "+testContainer, "ok",
+				"smoke test passed; local mode: "+localMode)
+		}
+	} else {
+		// No container specified: just report the mode. Note this is the LOCAL
+		// expected mode; the actual remote mode depends on the remote agent
+		// version (an old agent ignores RSB_CONTAINER_MODE).
+		report("docker", "ok", "local mode: "+localMode+" (use --container=NAME for a real test)")
+	}
+
+	if ok {
+		fmt.Fprintf(os.Stderr, "\nrsb: all checks passed\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "\nrsb: some checks FAILED (see above)\n")
+		os.Exit(1)
+	}
+}
+
+// cmdInstallLocal creates convenience symlinks bin/rsb, bin/rsb-daemon,
+// bin/rsb-agent pointing at the current platform's binaries. After this, the
+// caller can invoke <home>/bin/rsb directly without picking the platform dir,
+// and PATH=$HOME/.codex/skills/rsb/bin:$PATH "just works".
+func cmdInstallLocal(args []string) {
+	dir, err := paths.LocalPlatformDir()
+	if err != nil {
+		fatalf("cannot find platform binaries: %v", err)
+	}
+	home := paths.Home()
+	if home == "" {
+		fatalf("cannot find rsb home (set RSB_HOME or run from install dir)")
+	}
+	binDir := home + "/bin"
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		fatalf("mkdir %s: %v", binDir, err)
+	}
+	for _, bin := range []string{"rsb", "rsb-daemon", "rsb-agent"} {
+		target := dir + "/" + bin
+		link := binDir + "/" + bin
+		if _, err := os.Stat(target); err != nil {
+			fatalf("source missing: %s", target)
+		}
+		os.Remove(link) // refresh existing symlink
+		if err := os.Symlink(target, link); err != nil {
+			fatalf("symlink %s -> %s: %v", link, target, err)
+		}
+		fmt.Fprintf(os.Stderr, "  %s -> %s\n", link, target)
+	}
+	fmt.Fprintf(os.Stderr, "rsb: installed. add to PATH: export PATH=%s:$PATH\n", binDir)
+}
+
+// probeRemoteArch asks the host for its OS and machine arch via ssh.
+func probeRemoteArch(host string) (osName, arch string, err error) {
+	out, err := exec.Command("ssh", host, "uname -sm").Output()
+	if err != nil {
+		return "", "", err
+	}
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	if len(fields) < 2 {
+		return "", "", fmt.Errorf("unexpected uname output: %q", string(out))
+	}
+	osName = strings.ToLower(fields[0])
+	arch = normalizeArch(fields[1])
+	return osName, arch, nil
+}
+
+// normalizeArch maps uname -m outputs to the GOARCH names used in our dist dirs.
+func normalizeArch(m string) string {
+	switch m {
+	case "x86_64", "amd64":
+		return "amd64"
+	case "aarch64", "arm64":
+		return "arm64"
+	default:
+		return strings.ToLower(m)
+	}
+}
+
+// --- helpers ---
+
+func fatalf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "rsb: "+format+"\n", args...)
+	os.Exit(1)
+}
+
+func newID() string {
+	// Cheap unique-enough id: PID + nanoseconds. No uuid dep needed.
+	return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+}
+
+// --- daemon process management (for `rsb daemon stop|status`) ---
+
+func readPID() int {
+	b, err := os.ReadFile(paths.PIDFile())
+	if err != nil {
+		return 0
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	return pid
+}
+
+func processAlive(pid int) bool {
+	// kill 0 checks process existence without sending a signal.
+	if err := syscall.Kill(pid, 0); err != nil {
+		return false
+	}
+	return true
+}
+
+func killPID(pid int) error {
+	return syscall.Kill(pid, syscall.SIGTERM)
+}
+
+// multiFlag is a repeatable string flag.
+type multiFlag []string
+
+func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
+func (m *multiFlag) Set(s string) error { *m = append(*m, s); return nil }
