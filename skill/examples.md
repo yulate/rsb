@@ -1,88 +1,134 @@
 # rsb 实战示例
 
-这些例子展示 agent 在真实场景里如何用 rsb。核心原则不变：
-**命令永远是 argv JSON 数组，永不拼字符串走 ssh。**
+这些例子展示 agent 在真实场景里如何用 rsb。两条核心原则：
+1. **命令优先用 `--` 简写**（`rsb exec host -- cmd args`），需要程序化构造时才用 `--argv '<json>'`
+2. **文件操作走 rsb**（cp/sync/cat），不经 scp，无路径转义
 
-## 1. 探查远程主机
+## 0. 选对二进制（所有示例的前提）
 
 ```bash
 RSB="$(pwd)/bin/$(uname -s | tr A-Z a-z)-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64')/rsb"
+```
 
-# 系统信息
-"$RSB" exec prod --argv '["uname","-a"]'
-"$RSB" exec prod --argv '["df","-h","/"]'
-"$RSB" exec prod --argv '["free","-m"]'
+## 1. 探查远程主机（-- 简写）
+
+```bash
+# -- 后面直接是命令，CLI 本地组装 argv，不经 shell
+"$RSB" exec prod -- uname -a
+"$RSB" exec prod -- df -h /
+"$RSB" exec prod -- free -m
 
 # 用 session 保持位置，连续探查
-"$RSB" exec prod --session explore --argv '["cd","/var/log"]'
-"$RSB" exec prod --session explore --argv '["ls","-la"]'
-"$RSB" exec prod --session explore --argv '["tail","-n","50","syslog"]'
+"$RSB" exec prod --session explore -- cd /var/log
+"$RSB" exec prod --session explore -- ls -la
+"$RSB" exec prod --session explore -- tail -n 50 syslog
 ```
 
-## 2. 操作配置文件（复杂参数安全）
+## 2. 文件传输（cp / sync / cat）
+
+### 传单个文件（替代 scp）
 
 ```bash
-# 用 jq 读取嵌套字段 —— 引号在 JSON 里写 \"，不会出错
+# 上传代码到远端
+"$RSB" cp ./service.py prod:/opt/app/service.py
+
+# 下载日志回来分析
+"$RSB" cp prod:/var/log/app.log ./app.log
+```
+
+### 增量同步整个目录
+
+```bash
+# 只传变化的文件（mtime+size 判定）
+"$RSB" sync ./orchestrator prod:/home/ubuntu/app/orchestrator
+
+# 先看看会传哪些
+"$RSB" sync ./orchestrator prod:/home/ubuntu/app/orchestrator --dry-run
+```
+
+### 读远端文件（不下载，直接看）
+
+```bash
+# 看大日志的前 100 行 —— 只传这 100 行的字节，不是整个文件
+"$RSB" cat prod:/var/log/app.log --lines=1:100
+
+# 看配置文件的某一行
+"$RSB" cat prod:/etc/nginx/nginx.conf --lines=50
+
+# 只读前 4KB（防止巨型文件 OOM）
+"$RSB" cat prod:/var/log/app.log --max-bytes=4096
+```
+
+> `rsb cat` 是 agent 看远端配置/日志的首选——行范围在远端执行，省带宽和 token。
+
+## 3. 操作配置文件（复杂参数安全）
+
+```bash
+# jq 读嵌套字段 —— -- 简写里引号原样到达，不会出错
+"$RSB" exec prod -- jq '.database.host' /opt/app/config.json
+
+# grep 复杂正则 —— 正则里的特殊字符安全
+"$RSB" exec prod -- grep -rEn 'TODO|FIXME|XXX' src/
+
+# 需要程序化构造 argv 时，用 --argv JSON 形式
 "$RSB" exec prod --argv '["jq",".\"database\".\"host\"","/opt/app/config.json"]'
-
-# 写文件，内容含大量特殊字符
-"$RSB" exec prod --argv '["sh","-c","cat > /tmp/test.conf <<EOF\nKEY=\"value with spaces\"\nREGEX=^a.*b$\nEOF"]'
-
-# grep 复杂正则
-"$RSB" exec prod --argv '["grep","-rEn","(TODO|FIXME|XXX)","src/"]'
 ```
 
-## 3. Docker 容器调试
+## 4. Docker 容器调试（compose 服务名）
 
 ```bash
-# 列出容器（在主机上跑 docker，不是进容器）
-"$RSB" exec prod --argv '["docker","ps","--format","{{.Names}}\t{{.Status}}"]'
+# 列容器
+"$RSB" exec prod -- docker ps --format '{{.Names}}\t{{.Status}}'
 
-# 进入指定容器执行命令 —— argv 原样到达容器内进程
-"$RSB" exec prod --container api-server --argv '["env"]'
-"$RSB" exec prod --container api-server --argv '["cat","/app/config.json"]'
-"$RSB" exec prod --container api-server --argv '["ps","aux"]'
+# --container 支持 compose 服务名（api 自动找到 myproject-api-1）
+"$RSB" exec prod --container api -- env
+"$RSB" exec prod --container api -- cat /app/config.json
+"$RSB" exec prod --container api -- ps aux
 
-# 容器内看日志（带引号的路径安全）
-"$RSB" exec prod --container api-server --argv '["tail","-n","100","/var/log/app.log"]'
+# 容器内看日志（-- 简写）
+"$RSB" exec prod --container api -- tail -n 100 /var/log/app.log
 ```
 
-## 4. 部署 / 重启服务
+## 5. 部署 / 重启服务
 
 ```bash
 # 用 session 模拟完整部署流程
-"$RSB" exec prod --session deploy --argv '["cd","/opt/myapp"]'
-"$RSB" exec prod --session deploy --argv '["git","pull"]'
-"$RSB" exec prod --session deploy --argv '["docker","compose","up","-d","--build"]'
-"$RSB" exec prod --session deploy --argv '["docker","compose","ps"]'
+"$RSB" exec prod --session deploy -- cd /opt/myapp
+"$RSB" exec prod --session deploy -- git pull
+"$RSB" exec prod --session deploy -- docker compose up -d --build
+"$RSB" exec prod --session deploy -- docker compose ps
 
-# 验证服务起来了
-"$RSB" exec prod --argv '["curl","-sf","http://localhost:8080/health"]'
+# 同步代码后重启
+"$RSB" sync ./src prod:/opt/myapp/src
+"$RSB" exec prod --session deploy -- docker compose restart api
+
+# 验证健康
+"$RSB" exec prod -- curl -sf http://localhost:8080/health
 ```
 
-## 5. 排查问题（退出码驱动条件判断）
+## 6. 排查问题（退出码驱动条件判断）
 
 ```bash
 # rsb 退出码 = 远端命令退出码，可直接判断
-if "$RSB" exec prod --argv '["pgrep","-x","nginx"]' >/dev/null 2>&1; then
+if "$RSB" exec prod -- pgrep -x nginx >/dev/null 2>&1; then
     echo "nginx 在运行"
 else
-    echo "nginx 没运行，尝试启动"
-    "$RSB" exec prod --argv '["systemctl","start","nginx"]'
+    echo "nginx 没运行，启动它"
+    "$RSB" exec prod -- systemctl start nginx
 fi
 ```
 
-## 6. 传本地输入给远端
+## 7. 传本地输入给远端
 
 ```bash
 # 把本地文件内容喂给远端命令
-cat local_data.json | "$RSB" exec prod --stdin --argv '["python3","-m","json.tool"]'
+cat local_data.json | "$RSB" exec prod --stdin -- python3 -m json.tool
 
-# 交互式
-"$RSB" exec prod --stdin --argv '["sh"]'
+# 容器内管道
+echo "query" | "$RSB" exec prod --container db --stdin -- psql -U postgres
 ```
 
-## 7. 交互式 repl（连续调试）
+## 8. 交互式 repl（连续调试）
 
 ```bash
 "$RSB" repl prod --session debug
@@ -100,10 +146,10 @@ cat local_data.json | "$RSB" exec prod --stdin --argv '["python3","-m","json.too
 # ❌ 这些会让你几乎必然写错转义
 ssh prod "grep -rEn 'TODO|FIXME' \"src/\" | head"
 ssh prod "docker exec api sh -c 'cat /app/\"config file.json\"'"
-ssh prod "echo 'export KEY=\"value\"' >> ~/.bashrc"
+scp ./service.py prod:/opt/app/service.py   # 路径含空格就炸
 
 # ✅ 对应的 rsb 写法（确定性正确）
-"$RSB" exec prod --argv '["grep","-rEn","TODO|FIXME","src/"]'
-"$RSB" exec prod --container api --argv '["cat","/app/config file.json"]'
-"$RSB" exec prod --argv '["sh","-c","echo '\''export KEY=\"value\"'\'' >> ~/.bashrc"]'
+"$RSB" exec prod -- grep -rEn 'TODO|FIXME' src/
+"$RSB" exec prod --container api -- cat '/app/config file.json'
+"$RSB" cp ./service.py prod:/opt/app/service.py
 ```

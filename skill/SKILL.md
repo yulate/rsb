@@ -71,10 +71,23 @@ rsb exec prod --argv '["ls","-la","/var/log"]'
 rsb exec prod --argv '["printf","%s\n","config has \"key\": \"val\" and $HOME"]'
 
 # grep 带复杂正则 —— 正则里的特殊字符安全
-rsb exec prod --argv '["grep","-rEn","TODO|FIXME|HACK","src/"]'
+rsb exec prod --argv '["grep","-rEn","TODO|FIXME|HACK","src/"]']
 ```
 
-**对比传统 SSH 的灾难**（绝对不要这样做）：
+#### 更省事的写法：`--` 简写
+
+JSON 数组虽稳，但手写累。`--` 后面的参数直接成为 argv，CLI 本地组装，**不经任何 shell**：
+
+```bash
+# 这两种写法完全等价
+rsb exec prod --argv '["docker","ps","--format","{{.Names}}"]'
+rsb exec prod -- docker ps --format '{{.Names}}'
+
+# 引号、$、空格照样原样到达（-- 后是纯 argv）
+rsb exec prod -- printf '%s\n' 'has "double" and $HOME'
+```
+
+> `--` 简写是日常首选；`--argv '<json>'` 留给需要程序化构造 argv 的场景。**对比传统 SSH 的灾难**（绝对不要这样做）：
 ```bash
 # ❌ 这会让你几乎必然写错转义
 ssh prod "grep -rEn 'TODO|FIXME' \"src/\" | head"
@@ -101,6 +114,19 @@ rsb exec prod --container api --argv '["ps","aux"]'
 
 # 容器内执行带引号的命令 —— 同样免疫
 rsb exec prod --container api --argv '["sh","-c","echo \"PG ready at $PGHOST:$PGPORT\""]']
+
+# -- 简写也能用于容器
+rsb exec prod --container api -- ps aux
+```
+
+#### compose 服务名自动解析
+
+`--container` 支持 **docker compose 服务名**：写 `api` 会自动找到 `myproject-api-1`（通过 `com.docker.compose.service` label），不用记全名：
+
+```bash
+# 这两个等价（compose 自动解析）
+rsb exec prod --container api -- pwd
+rsb exec prod --container myproject-api-1 -- pwd
 ```
 
 #### 容器执行故障兜底（重要）
@@ -154,6 +180,54 @@ rsb exec prod --timeout 30000 --argv '["curl","http://health"]'   # 30 秒
 echo "input data" | rsb exec prod --stdin --argv '["cat"]'
 ```
 
+## 文件传输：rsb cp / sync / cat
+
+rsb 的文件操作走**同一条 daemon 连接**，不经 scp，无路径转义。文件内容以协议帧传输，二进制安全，支持 sha256 校验和原子写入。
+
+### rsb cp（单文件互传）
+
+```bash
+# 上传：本地 -> 远程
+rsb cp ./service.py prod:/opt/app/service.py
+
+# 下载：远程 -> 本地
+rsb cp prod:/var/log/app.log ./app.log
+
+# 相对路径（远程相对于 home）
+rsb cp ./config.json prod:config.json
+```
+
+原子写入（临时文件 + rename）+ sha256 校验，传输损坏会明确失败而非留下半截文件。
+
+### rsb sync（增量上传目录）
+
+```bash
+# 增量同步目录：只传 mtime/size 变化的文件
+rsb sync ./orchestrator prod:/home/ubuntu/app/orchestrator
+
+# 预览会传哪些（不实际写入）
+rsb sync ./orchestrator prod:/home/ubuntu/app/orchestrator --dry-run
+```
+
+mtime+size 启发式（rsync 风格），上传后设置远端 mtime，二次 sync 正确 skip 只传改动的文件。
+
+### rsb cat（读远端文件，支持行范围）
+
+**行范围和字节上限在远端执行**——只传请求的字节，不传整个文件。看大日志/配置的头部时极其省带宽：
+
+```bash
+# 读远端日志前 100 行
+rsb cat prod:/var/log/app.log --lines=1:100
+
+# 只读第 50 行
+rsb cat prod:/etc/nginx/nginx.conf --lines=50
+
+# 前 4KB（防止大文件 OOM）
+rsb cat prod:/var/log/app.log --max-bytes=4096
+```
+
+> agent 日常最该用的文件命令：`rsb cat` 看配置/日志头部，`rsb cp` 传单个文件，`rsb sync` 同步代码目录。替代 `scp` + `ssh "cat file | head"`。
+
 ## 安装：rsb ensure
 
 首次对一台主机操作前，把 `rsb-agent` 安装到远端 `~/.rsb/`：
@@ -191,25 +265,34 @@ export PATH=$(pwd)/bin:$PATH
 ## 完整选项速查
 
 ```
-rsb exec <host> --argv '<json>' [flags]
-  --argv '<json>'    必填，JSON 字符串数组
+rsb exec <host> --argv '<json>' [flags]      # JSON 数组形式（权威，任何引号都安全）
+rsb exec <host> -- cmd args...               # -- 简写形式（日常首选，不经 shell）
+
+exec flags:
+  --argv '<json>'    JSON 字符串数组（与 -- 二选一）
   --cwd DIR          工作目录
-  --env K=V          环境变量（可重复）
+  --env K=V          环境变量（可重复，值不展开）
   --timeout MS       超时毫秒
-  --session NAME     会话名（cwd/env 跨命令持久）
-  --container NAME   在容器内执行
+  --session NAME     会话名（cwd/env 跨命令持久，cd 生效）
+  --container NAME   在容器内执行（支持 compose 服务名）
   --stdin            从本地 stdin 读输入喂给远端
   --local            本机执行，不连 SSH
 
-rsb repl <host> [--session NAME]    交互式多命令
-rsb ensure <host>                   安装远端 agent
-rsb doctor [host]                   自检（home/二进制/daemon/ssh/docker）
-rsb install-local                   建 bin/ symlink，方便加入 PATH
-rsb daemon status|stop              管理本地 daemon（通常自动）
+rsb cp <src> <dst>                   单文件互传（host:path 语法，原子+sha256 校验）
+rsb cat <host:path> [--lines N:M]    读远端文件/切片到 stdout（行范围远端执行）
+       [--max-bytes N]
+rsb sync <dir> <host:dir> [--dry-run] 增量上传目录（mtime+size 判定）
+rsb repl <host> [--session NAME]     交互式多命令
+rsb ensure <host> [--force]          安装/升级远端 agent（sha256 校验）
+rsb agent-version <host>             查远端 agent 版本
+rsb doctor [host] [--container=NAME] 自检（home/二进制/daemon/ssh/docker）
+rsb install-local                    建 bin/ symlink，方便加入 PATH
+rsb daemon status|stop               管理本地 daemon（通常自动）
 rsb version
 ```
 
 容器执行模式可选：默认 `docker exec`（普通用户友好）；设 `RSB_CONTAINER_MODE=nsenter` 用 nsenter（需 root，更快）。
+`--container` 支持 compose 服务名（`api` → `myproject-api-1`）。
 
 ## agent 操作清单（典型工作流）
 
