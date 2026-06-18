@@ -48,6 +48,18 @@ func main() {
 			return
 		}
 		cmdExec(os.Args[2:])
+	case "cp":
+		if wantsHelp(os.Args[2:]) {
+			helpCp()
+			return
+		}
+		cmdCp(os.Args[2:])
+	case "sync":
+		if wantsHelp(os.Args[2:]) {
+			helpSync()
+			return
+		}
+		cmdSync(os.Args[2:])
 	case "repl":
 		if wantsHelp(os.Args[2:]) {
 			helpRepl()
@@ -121,6 +133,9 @@ USAGE
 
 COMMANDS
   exec <host> --argv '<json>'   Execute a command (argv array, no shell)
+  exec <host> -- cmd args       ...or the ergonomic -- shorthand
+  cp <src> <dst>                Copy a file local<->remote (host:path)
+  sync <dir> <host:dir>         Incrementally upload a directory
   repl <host>                   Interactive multi-command session
   ensure <host> [--force]       Install/upgrade rsb-agent on a remote host
   agent-version <host>          Show the agent version installed on a host
@@ -290,6 +305,100 @@ EXAMPLE
 `)
 }
 
+// cmdCp: rsb cp <src> <dst> — copy a single file between local and remote.
+//   rsb cp local.py prod:/opt/app/x.py       (upload)
+//   rsb cp prod:/var/log/app.log ./app.log   (download)
+func cmdCp(args []string) {
+	if len(args) < 2 {
+		fatalf("usage: rsb cp <src> <dst>\n  e.g. rsb cp local.py prod:/opt/app/x.py")
+	}
+	src := client.ParsePath(args[0])
+	dst := client.ParsePath(args[1])
+	if err := client.CP(src, dst); err != nil {
+		fatalf("cp: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "rsb: %s -> %s ok\n", args[0], args[1])
+}
+
+// cmdSync: rsb sync <localDir> <host:remoteDir> [--dry-run]
+// Uploads local files to remote, transferring only those whose mtime/size
+// differ (rsync-style heuristic).
+func cmdSync(args []string) {
+	dryRun := false
+	var positional []string
+	for _, a := range args {
+		if a == "--dry-run" {
+			dryRun = true
+		} else {
+			positional = append(positional, a)
+		}
+	}
+	if len(positional) < 2 {
+		fatalf("usage: rsb sync <localDir> <host:remoteDir> [--dry-run]")
+	}
+	srcDir := positional[0]
+	dst := client.ParsePath(positional[1])
+	res, err := client.Sync(srcDir, dst, dryRun)
+	if err != nil {
+		fatalf("sync: %v", err)
+	}
+	for _, f := range res.Uploaded {
+		fmt.Fprintf(os.Stderr, "  upload  %s\n", f)
+	}
+	for _, f := range res.Skipped {
+		fmt.Fprintf(os.Stderr, "  skip    %s\n", f)
+	}
+	for f, e := range res.Failed {
+		fmt.Fprintf(os.Stderr, "  FAIL    %s: %v\n", f, e)
+	}
+	summary := fmt.Sprintf("%d uploaded, %d skipped", len(res.Uploaded), len(res.Skipped))
+	if len(res.Failed) > 0 {
+		summary += fmt.Sprintf(", %d failed", len(res.Failed))
+	}
+	if dryRun {
+		summary += " (dry-run)"
+	}
+	fmt.Fprintf(os.Stderr, "rsb: %s\n", summary)
+	if len(res.Failed) > 0 {
+		os.Exit(1)
+	}
+}
+
+func helpCp() {
+	fmt.Print(`rsb cp - copy a single file between local and remote
+
+USAGE
+  rsb cp <src> <dst>
+
+One side must be local, the other remote (host:path). File content travels
+over the rsb daemon connection — no scp, no path escaping.
+
+EXAMPLES
+  rsb cp ./service.py prod:/opt/app/service.py       # upload
+  rsb cp prod:/var/log/app.log ./app.log             # download
+  rsb cp ./config.json prod:config.json              # upload (relative to remote home)
+`)
+}
+
+func helpSync() {
+	fmt.Print(`rsb sync - upload a local directory to a remote host (incremental)
+
+USAGE
+  rsb sync <localDir> <host:remoteDir> [--dry-run]
+
+Walks localDir and uploads each file to remoteDir, transferring only files
+whose size or mtime differs from the remote copy (rsync-style heuristic).
+Atomic writes + sha256 verification per file.
+
+OPTIONS
+  --dry-run    list what would transfer without writing
+
+EXAMPLES
+  rsb sync ./orchestrator prod:/home/ubuntu/app/orchestrator
+  rsb sync ./orchestrator prod:/home/ubuntu/app/orchestrator --dry-run
+`)
+}
+
 // cmdRepl: rsb repl <host> [--session NAME] [--local]
 func cmdRepl(args []string) {
 	host := "local"
@@ -329,6 +438,7 @@ func cmdExec(args []string) {
 
 	var (
 		argvStr   string
+		argvRest  []string // argv from the `--` shorthand
 		cwd       string
 		envFlags  multiFlag
 		timeoutMs int
@@ -336,8 +446,18 @@ func cmdExec(args []string) {
 		container string
 		stdinFlag bool
 	)
+	// Two argv forms:
+	//   --argv '<json>'   explicit JSON array (authoritative; safe for any quoting)
+	//   -- a b c          shorthand: everything after `--` becomes argv verbatim.
+	// The `--` form is the ergonomic one — no JSON, no quoting. The CLI builds
+	// argv[] locally; it NEVER reaches a shell, so spaces/quotes in args are
+	// preserved exactly the same way as the JSON form.
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
+		if a == "--" {
+			argvRest = rest[i+1:]
+			break
+		}
 		switch a {
 		case "--argv":
 			i++
@@ -372,19 +492,26 @@ func cmdExec(args []string) {
 		case "--stdin":
 			stdinFlag = true
 		default:
-			fatalf("unknown flag: %s", a)
+			fatalf("unknown flag: %s (use -- to pass a raw command)", a)
 		}
 	}
 
-	if argvStr == "" {
-		fatalf("--argv is required (JSON array, e.g. '[\"echo\",\"hi\"]')")
-	}
+	// Resolve argv from exactly one of the two forms.
 	var argv []string
-	if err := json.Unmarshal([]byte(argvStr), &argv); err != nil {
-		fatalf("invalid --argv JSON: %v", err)
+	switch {
+	case argvStr != "" && len(argvRest) > 0:
+		fatalf("specify either --argv '<json>' OR -- <cmd>, not both")
+	case argvStr != "":
+		if err := json.Unmarshal([]byte(argvStr), &argv); err != nil {
+			fatalf("invalid --argv JSON: %v", err)
+		}
+	case len(argvRest) > 0:
+		argv = argvRest
+	default:
+		fatalf("argv is required: rsb exec <host> --argv '<json>'   OR   rsb exec <host> -- cmd args...")
 	}
 	if len(argv) == 0 {
-		fatalf("--argv is empty")
+		fatalf("argv is empty")
 	}
 	envMap := map[string]string{}
 	for _, kv := range envFlags {

@@ -41,14 +41,16 @@ const MaxPayload = 64 << 20
 type FrameKind string
 
 const (
-	KindRequest  FrameKind = "request"  // client -> agent: start an exec
-	KindStdin    FrameKind = "stdin"    // client -> agent: stream bytes to a running process's stdin
-	KindEndStdin FrameKind = "end_stdin" // client -> agent: signal EOF on a process's stdin
-	KindCancel   FrameKind = "cancel"   // client -> agent: kill a running process
-	KindOutput   FrameKind = "output"   // agent -> client: a chunk of process output
-	KindResult   FrameKind = "result"   // agent -> client: process exited
-	KindError    FrameKind = "error"    // agent -> client: request could not run
-	KindHello    FrameKind = "hello"    // agent -> client: handshake (version, caps)
+	KindRequest    FrameKind = "request"     // client -> agent: start an exec/file op
+	KindStdin      FrameKind = "stdin"       // client -> agent: stream bytes to a running process's stdin
+	KindEndStdin   FrameKind = "end_stdin"   // client -> agent: signal EOF on a process's stdin
+	KindCancel     FrameKind = "cancel"      // client -> agent: kill a running process
+	KindOutput     FrameKind = "output"      // agent -> client: a chunk of process output
+	KindResult     FrameKind = "result"      // agent -> client: process exited / op done
+	KindError      FrameKind = "error"       // agent -> client: request could not run
+	KindHello      FrameKind = "hello"       // agent -> client: handshake (version, caps)
+	KindFileChunk  FrameKind = "file_chunk"  // bidirectional: a chunk of file content
+	KindFileStat   FrameKind = "file_stat"   // agent -> client: result of a file_stat request
 )
 
 // Frame is the envelope on the wire. Exactly one of Request/Output/Result/
@@ -58,8 +60,14 @@ type Frame struct {
 	Body json.RawMessage `json:"body"`
 }
 
-// Request starts an exec. Argv is the canonical representation: never a shell
-// string, always an array passed straight to execve.
+// Request starts an operation. Type selects what:
+//   - "exec": run argv via execve (the original use)
+//   - "file_stat": query a remote file's stat (size, mtime, mode) for sync
+//   - "file_get": agent streams the file back to the client (download)
+//   - "file_put": client streams FileChunk frames; agent writes atomically
+//
+// For exec, Argv is the canonical representation: never a shell string, always
+// an array passed straight to execve.
 //
 // Stdin for the process is NOT carried inline here (P1 change). Instead the
 // client sends zero or more Stdin frames after the Request, then one
@@ -68,13 +76,23 @@ type Frame struct {
 // no EndStdin, the agent treats stdin as /dev/null (typical for one-shot exec).
 type Request struct {
 	ID        string            `json:"id"`
-	Type      string            `json:"type"`             // currently only "exec"
-	Argv      []string          `json:"argv"`             // execve argv, no shell
+	Type      string            `json:"type"`             // "exec" | "file_stat" | "file_get" | "file_put"
+	Argv      []string          `json:"argv,omitempty"`   // exec: execve argv, no shell
 	Cwd       string            `json:"cwd,omitempty"`    // working dir; "" = session's cwd
 	Env       map[string]string `json:"env,omitempty"`    // extra/override env; no expansion
 	TimeoutMs int               `json:"timeout_ms,omitempty"`
-	Container string            `json:"container,omitempty"` // P2: nsenter/docker
-	Session   string            `json:"session,omitempty"`  // P1: session whose cwd/env to inherit
+	Container string            `json:"container,omitempty"`
+	Session   string            `json:"session,omitempty"`
+
+	// File ops (Type = file_*). Path is relative to Cwd if not absolute.
+	// For file_put, Mode is the desired file mode (e.g. 0644); 0 = inherit.
+	// Mtime (unix seconds) lets sync set the remote file's mtime to match the
+	// local source so the next sync's mtime+size check skips it.
+	// AtomicPut requests the agent write to a temp file then rename.
+	Path       string `json:"path,omitempty"`
+	Mode       int    `json:"mode,omitempty"`
+	Mtime      int64  `json:"mtime,omitempty"`
+	AtomicPut  bool   `json:"atomic_put,omitempty"`
 
 	// StdinClosed indicates the client promises no Stdin frames will follow
 	// and the process should get EOF on stdin immediately. Equivalent to the
@@ -132,11 +150,34 @@ type Error struct {
 // Hello is the first frame the agent sends after startup.
 type Hello struct {
 	Version int      `json:"version"`
-	Caps    []string `json:"caps"` // e.g. ["exec","sessions"]; P0: ["exec"]
+	Caps    []string `json:"caps"` // e.g. ["exec","sessions","files"]; P0: ["exec"]
 }
 
 // ProtocolVersion is bumped on breaking wire-format changes.
 const ProtocolVersion = 2
+
+// FileChunk is one piece of file content, bidirectional. For file_get the agent
+// sends these back; for file_put the client sends them. The final chunk sets
+// Done=true and (optionally) Sha256 so the receiver can verify integrity.
+// Data is base64 over the wire (json []byte encoding), so binary-safe.
+type FileChunk struct {
+	ID     string `json:"id"`
+	Data   []byte `json:"data"`
+	Done   bool   `json:"done,omitempty"`
+	Sha256 string `json:"sha256,omitempty"`
+}
+
+// FileStat is the agent's reply to a file_stat request: the remote file's
+// metadata, used by sync to decide whether to transfer. If the file doesn't
+// exist, Exists=false and the rest is zero.
+type FileStat struct {
+	ID      string `json:"id"`
+	Exists  bool   `json:"exists"`
+	Size    int64  `json:"size"`
+	ModTime int64  `json:"mod_time"` // unix seconds
+	Mode    uint32 `json:"mode"`     // os.FileMode bits
+	IsDir   bool   `json:"is_dir"`
+}
 
 // ---- frame I/O ----
 

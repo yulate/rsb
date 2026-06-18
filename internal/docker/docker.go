@@ -54,13 +54,40 @@ type SocketPermissionError struct{ Detail string }
 func (e *SocketPermissionError) Error() string { return e.Detail }
 
 // ResolveContainer maps a user-facing container name to the target the
-// adapter can act on. For a plain container name or id this is the identity;
-// it's a hook so future compose-service or k8s-pod resolution can plug in.
+// adapter can act on. Identity for exact names; resolveContainerName (called
+// from BuildArgv) handles compose-service-name lookup.
 func ResolveContainer(name string) (string, error) {
 	if name == "" {
 		return "", errors.New("empty container name")
 	}
 	return name, nil
+}
+
+// resolveContainerName turns a possibly-compose-service name into a real
+// container name/id. If `name` is already a valid container, returned as-is.
+// Otherwise looks it up by the com.docker.compose.service label, so
+// `--container api` finds the `myproject-api-1` compose container.
+func resolveContainerName(name string) string {
+	// Is it a real running container? `docker inspect` is the cheapest check.
+	if out, err := exec.Command("docker", "inspect", "-f", "{{.Id}}", name).Output(); err == nil {
+		if id := strings.TrimSpace(string(out)); id != "" {
+			return name // exact match
+		}
+	}
+	// Compose service lookup: containers carry label
+	// com.docker.compose.service=<service>. Match the first running one.
+	out, err := exec.Command("docker", "ps", "--filter",
+		"label=com.docker.compose.service="+name,
+		"--format", "{{.Names}}").Output()
+	if err != nil {
+		return name // docker failed; let BuildArgv surface the real error
+	}
+	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			return l // first matching compose container
+		}
+	}
+	return name // nothing resolved; use as given
 }
 
 // hasDocker reports whether docker is on PATH.
@@ -133,6 +160,9 @@ func BuildArgv(container string, userArgv []string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Compose service-name resolution: turn "api" into "myproject-api-1" if
+	// it's a compose service rather than a literal container name.
+	container = resolveContainerName(container)
 	if !hasDocker() {
 		return nil, ErrNoContainerRuntime
 	}

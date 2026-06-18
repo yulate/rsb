@@ -5,6 +5,28 @@
 
 ---
 
+## [0.6.0] - 2026-06-18
+
+文件传输 + argv 简写 + compose 适配。把 rsb 从"远程执行工具"升级为"远程维护工具"。
+
+### 新增
+- **`rsb cp <src> <dst>`**：单文件在本地与远程间互传（`host:path` 语法）。文件内容走 rsb 的 daemon 连接，不经 scp、无路径转义。支持上传/下载、原子写入、sha256 校验、二进制安全。
+- **`rsb sync <dir> <host:dir> [--dry-run]`**：增量上传目录。mtime+size 启发式判定差异（rsync 风格），只传变化的文件；上传后设置远端 mtime，二次 sync 正确 skip。原子写入 + sha256 校验每个文件。
+- **`--` argv 简写**：`rsb exec host -- docker ps --format '{{.Names}}'`，CLI 本地把 `--` 后的参数转成 argv，不经任何 shell。和 `--argv '<json>'` 等价但手写更舒服。
+- **compose 服务名解析**：`--container api` 自动解析到 `myproject-api-1`（通过 `com.docker.compose.service` label 查找），无需记全名。
+
+### 协议
+- 新增帧类型：`file_chunk`（双向文件内容流）、`file_stat`（远端文件元数据）。
+- Request 新增字段：`Path`、`Mode`、`Mtime`、`AtomicPut`；Type 扩展为 `exec|file_stat|file_get|file_put`。
+- agent 新增 `files` capability。
+
+### 实现
+- agent 端 file_put 同步处理（不开 goroutine），天然背压，避免 channel 死锁。
+- daemon bridge 转发 `file_chunk` 帧（与 stdin/end_stdin/cancel 同级）。
+- client `PathSpec` 解析 `host:path` 语法，`IsRemote()` 区分本地/远端。
+
+---
+
 ## [0.5.1] - 2026-06-18
 
 修复 daemon 连接死亡时 exec 永久卡住的严重问题。

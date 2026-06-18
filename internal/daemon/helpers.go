@@ -126,8 +126,11 @@ func bridge(c net.Conn, hc *hostConn) {
 					}
 				}
 			}()
-		case protocol.KindStdin, protocol.KindEndStdin, protocol.KindCancel:
-			// Control frames for an existing request: forward and forget.
+		case protocol.KindStdin, protocol.KindEndStdin, protocol.KindCancel,
+			protocol.KindFileChunk:
+			// Control/stream frames for an existing request: forward and forget.
+			// FileChunk carries file content for a file_put in progress; it must
+			// be forwarded just like Stdin chunks or the put would hang forever.
 			hc.send(f)
 		default:
 			log.Printf("ignoring client frame kind=%q", f.Kind)

@@ -119,7 +119,7 @@ func (a *agent) run(stdin io.Reader, stdout io.Writer) {
 	// Hello first so the daemon can version-check before sending requests.
 	a.writeFrame(protocol.KindHello, protocol.Hello{
 		Version: protocol.ProtocolVersion,
-		Caps:    []string{"exec", "sessions", "stream_stdin", "cancel"},
+		Caps:    []string{"exec", "sessions", "stream_stdin", "cancel", "files"},
 	})
 
 	// Single reader loop. All frames (Request, Stdin, EndStdin, Cancel) arrive
@@ -145,7 +145,27 @@ func (a *agent) run(stdin io.Reader, stdout io.Writer) {
 				log.Printf("bad request body: %v", err)
 				continue
 			}
-			a.dispatchExec(req)
+			switch req.Type {
+			case "exec", "":
+				a.dispatchExec(req)
+			case "file_stat":
+				a.handleFileStat(req)
+			case "file_get":
+				go a.handleFileGet(req)
+			case "file_put":
+				// Run SYNCHRONOUSLY in the read loop, NOT in a goroutine. A
+				// file_put streams FileChunk frames that the main loop must
+				// read one at a time; if we ran it async with a channel, the
+				// channel buffer would fill and deadlock against the read loop.
+				// Synchronous = the loop naturally backpressures: read chunk,
+				// write to disk, read next. No other request runs during a
+				// put, which is fine (cp/sync are exclusive operations).
+				a.handleFilePutSync(req, stdin)
+			default:
+				a.writeFrame(protocol.KindError, protocol.Error{
+					ID: req.ID, Reason: "unsupported request type: " + req.Type,
+				})
+			}
 		case protocol.KindStdin:
 			var s protocol.Stdin
 			if err := json.Unmarshal(f.Body, &s); err == nil {
