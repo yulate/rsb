@@ -17,7 +17,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-VERSION="${VERSION:-0.7.0}"
+VERSION="${VERSION:-0.8.0}"
 BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # Common flags; each binary gets its own -X for its version variable name.
 LDFLAGS_COMMON="-s -w"  # strip debug info

@@ -61,6 +61,21 @@ RSB="$(pwd)/bin/$(uname -s | tr A-Z a-z)-$(uname -m | sed 's/x86_64/amd64/;s/aar
 
 > `rsb cat` 是 agent 看远端配置/日志的首选——行范围在远端执行，省带宽和 token。
 
+### 搜远端代码库（只传命中行）
+
+```bash
+# 搜代码里的 TODO/FIXME —— rg 在远端跑，只传命中行回来
+"$RSB" grep prod 'TODO|FIXME' /opt/app/src
+
+# 忽略大小写，只搜 Python 文件
+"$RSB" grep prod -i --glob='*.py' 'def main' /opt/app
+
+# 限制命中数，避免巨量结果
+"$RSB" grep prod --max-matches=20 'database' /opt/app/config
+```
+
+> `rsb grep` 比 `rsb exec prod -- grep -rn ...` 更省带宽：ripgrep 的 --json 输出被解析成结构化的 file:line:content，且搜索在远端 CPU 上跑（用远端的 gitignore）。
+
 ## 3. 操作配置文件（复杂参数安全）
 
 ```bash

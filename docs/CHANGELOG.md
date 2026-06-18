@@ -5,6 +5,15 @@
 
 ---
 
+## [0.8.0] - 2026-06-18
+
+### 新增
+- **`rsb grep <host> <pattern> [paths]`**：在远端用 ripgrep 搜索，解析 `rg --json` 输出为结构化的 `file:line:content`。**只传命中行**，不是整个文件或全部 grep 输出——对 agent 在远端代码库里找东西极其省带宽。支持 `-i`/`--glob`/`--max-matches`/`-w`/`-F`。对标 Warp 的 `RipgrepSearchRequest`。
+  - 远端无 rg 时给出安装提示和 `grep -rn` fallback 建议。
+  - 零协议改动：client 端组合 exec + 本地解析 rg JSON。
+
+---
+
 ## [0.7.0] - 2026-06-18
 
 借鉴 Warp 开源实现后的韧性 + 可读性增强。

@@ -103,6 +103,12 @@ func main() {
 			return
 		}
 		cmdCat(os.Args[2:])
+	case "grep":
+		if wantsHelp(os.Args[2:]) {
+			helpGrep()
+			return
+		}
+		cmdGrep(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Printf("rsb %s (protocol v%d)\n", version, protocol.ProtocolVersion)
 	default:
@@ -143,6 +149,7 @@ COMMANDS
   exec <host> -- cmd args       ...or the ergonomic -- shorthand
   cp <src> <dst>                Copy a file local<->remote (host:path)
   cat <host:path>               Read a remote file (or slice) to stdout
+  grep <host> <pattern> [paths] Search remote files with ripgrep
   sync <dir> <host:dir>         Incrementally upload a directory
   repl <host>                   Interactive multi-command session
   ensure <host> [--force]       Install/upgrade rsb-agent on a remote host
@@ -473,6 +480,106 @@ func applyCatLimits(w io.Writer, r io.Reader, linesFlag, maxBytesFlag string) {
 		}
 		total += int64(len(out))
 		w.Write(out)
+	}
+}
+
+func helpGrep() {
+	fmt.Print(`rsb grep - search remote files with ripgrep (structured, bandwidth-efficient)
+
+USAGE
+  rsb grep <host> [options] <pattern> [paths...]
+  rsb grep --local [options] <pattern> [paths...]
+
+Runs ripgrep on the REMOTE host, parsing its --json output into clean
+file:line:content lines. Only matched lines travel back — not whole files.
+Honors the remote's .gitignore.
+
+OPTIONS
+  -i, --ignore-case     case-insensitive
+  -w, --word             match whole words only
+  -F, --fixed            literal string (not regex)
+  --glob PATTERN         include only matching files (e.g. "*.go")
+  --max-matches N        stop after N hits
+  --cwd DIR              search root if paths are relative (default: remote home)
+
+EXAMPLES
+  rsb grep prod 'TODO|FIXME' /opt/app/src
+  rsb grep prod -i --glob '*.py' 'def main' /opt/app
+  rsb grep prod --max-matches 20 'database' /opt/app/config
+  rsb grep --local 'func.*Session' internal/
+
+If the remote lacks rg, the error says so; fall back to:
+  rsb exec <host> -- grep -rn 'pattern' /path
+`)
+}
+
+// cmdGrep: rsb grep <host> [flags] <pattern> [paths...]
+// Searches remote files with ripgrep, printing structured file:line:content.
+func cmdGrep(args []string) {
+	host := "local"
+	rest := args
+	if len(rest) > 0 && rest[0] == "--local" {
+		rest = rest[1:]
+	} else if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		host = rest[0]
+		rest = rest[1:]
+	}
+
+	opts := client.SearchOptions{}
+	var positional []string
+	for i := 0; i < len(rest); i++ {
+		a := rest[i]
+		// Support both --flag value and --flag=value forms.
+		if eq := strings.IndexByte(a, '='); eq > 0 && strings.HasPrefix(a, "--") {
+			key := a[:eq]
+			val := a[eq+1:]
+			switch key {
+			case "--glob":
+				opts.Glob = val
+				continue
+			case "--max-matches":
+				opts.MaxMatches, _ = strconv.Atoi(val)
+				continue
+			}
+		}
+		switch a {
+		case "-i", "--ignore-case":
+			opts.IgnoreCase = true
+		case "-w", "--word":
+			opts.WordRegex = true
+		case "-F", "--fixed":
+			opts.Fixed = true
+		case "--glob":
+			i++
+			if i < len(rest) {
+				opts.Glob = rest[i]
+			}
+		case "--max-matches":
+			i++
+			if i < len(rest) {
+				opts.MaxMatches, _ = strconv.Atoi(rest[i])
+			}
+		default:
+			positional = append(positional, a)
+		}
+	}
+	if len(positional) < 1 {
+		fatalf("usage: rsb grep <host> [options] <pattern> [paths...]")
+	}
+	pattern := positional[0]
+	opts.Roots = positional[1:]
+
+	sess, err := client.NewSession(host)
+	if err != nil {
+		fatalf("%v", err)
+	}
+	defer sess.Close()
+	count, err := sess.Grep(pattern, opts, os.Stdout)
+	if err != nil {
+		fatalf("%v", err)
+	}
+	if count == 0 {
+		fmt.Fprintln(os.Stderr, "rsb: no matches")
 	}
 }
 

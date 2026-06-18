@@ -226,7 +226,24 @@ rsb cat prod:/etc/nginx/nginx.conf --lines=50
 rsb cat prod:/var/log/app.log --max-bytes=4096
 ```
 
-> agent 日常最该用的文件命令：`rsb cat` 看配置/日志头部，`rsb cp` 传单个文件，`rsb sync` 同步代码目录。替代 `scp` + `ssh "cat file | head"`。
+> agent 日常最该用的文件命令：`rsb cat` 看配置/日志头部，`rsb cp` 传单个文件，`rsb sync` 同步代码目录，`rsb grep` 搜远端代码库。替代 `scp` + `ssh "cat file | head"`。
+
+### rsb grep（搜远端文件，结构化结果）
+
+在远端用 ripgrep 搜索，**只传命中的行回来**（不是整个文件或全部 grep 输出）。对 agent 在远端代码库里找东西极其省带宽：
+
+```bash
+# 搜 TODO/FIXME
+rsb grep prod 'TODO|FIXME' /opt/app/src
+
+# 忽略大小写 + 只搜 .py 文件
+rsb grep prod -i --glob='*.py' 'def main' /opt/app
+
+# 限制前 20 个命中
+rsb grep prod --max-matches=20 'database' /opt/app/config
+```
+
+> 远端需要装 ripgrep（`apt install ripgrep`）。没有的话 fallback：`rsb exec prod -- grep -rn 'pattern' /path`（仍比 SSH 安全，只是结果非结构化）。
 
 ## 安装：rsb ensure
 
@@ -281,6 +298,8 @@ exec flags:
 rsb cp <src> <dst>                   单文件互传（host:path 语法，原子+sha256 校验）
 rsb cat <host:path> [--lines N:M]    读远端文件/切片到 stdout（行范围远端执行）
        [--max-bytes N]
+rsb grep <host> <pattern> [paths]   搜远端文件（ripgrep，只传命中行）
+       [-i] [--glob G] [--max-matches N]
 rsb sync <dir> <host:dir> [--dry-run] 增量上传目录（mtime+size 判定）
 rsb repl <host> [--session NAME]     交互式多命令
 rsb ensure <host> [--force]          安装/升级远端 agent（sha256 校验）
