@@ -33,13 +33,14 @@ import (
 
 // session is one daemon connection, bound to a host. It lets cp/sync issue
 // many requests without reconnecting each time.
-type session struct {
+type Session struct {
 	conn net.Conn
 }
 
-// newSession dials the daemon (auto-starting it), attaches to host, and drains
-// the forwarded Hello. Returns a session ready for requests.
-func newSession(host string) (*session, error) {
+// NewSession dials the daemon (auto-starting it), attaches to host, and drains
+// the forwarded Hello. Returns a session ready for requests. Exported so cmd/rsb
+// commands (cat, etc.) can use it directly.
+func NewSession(host string) (*Session, error) {
 	conn, err := dialOrStart()
 	if err != nil {
 		return nil, err
@@ -60,32 +61,32 @@ func newSession(host string) (*session, error) {
 		conn.Close()
 		return nil, errors.New(e.Reason)
 	}
-	return &session{conn: conn}, nil
+	return &Session{conn: conn}, nil
 }
 
-func (s *session) close() { s.conn.Close() }
+func (s *Session) Close() { s.conn.Close() }
 
 // send writes one request frame.
-func (s *session) send(req *protocol.Request) error {
+func (s *Session) send(req *protocol.Request) error {
 	return protocol.WriteFrame(s.conn, protocol.KindRequest, req)
 }
 
 // sendChunk writes one FileChunk frame (for file_put uploads).
-func (s *session) sendChunk(c protocol.FileChunk) error {
+func (s *Session) sendChunk(c protocol.FileChunk) error {
 	return protocol.WriteFrame(s.conn, protocol.KindFileChunk, c)
 }
 
 // readFrame reads the next frame (blocking).
-func (s *session) readFrame() (*protocol.Frame, error) {
+func (s *Session) readFrame() (*protocol.Frame, error) {
 	return protocol.ReadFrame(s.conn)
 }
 
 // ---- file stat ----
 
 // FileStat queries a remote file's metadata.
-func (s *session) FileStat(remotePath, cwd string) (*protocol.FileStat, error) {
+func (s *Session) FileStat(remotePath, cwd string) (*protocol.FileStat, error) {
 	id := fileID()
-	if err := s.send(&protocol.Request{ID: id, Type: "file_stat", Path: remotePath, Cwd: cwd}); err != nil {
+	if err := s.send(&protocol.Request{ID: id, Type: "file_stat", Scope: "host", Path: remotePath, Cwd: cwd}); err != nil {
 		return nil, err
 	}
 	for {
@@ -109,20 +110,39 @@ func (s *session) FileStat(remotePath, cwd string) (*protocol.FileStat, error) {
 
 // ---- file get (download: remote -> local) ----
 
-// FileGet downloads a remote file, writing content to w. Returns the sha256
-// the agent reported (empty if the agent didn't send one).
-func (s *session) FileGet(remotePath, cwd string, w io.Writer) (string, error) {
+// FileGetOptions controls a file_get: line range and byte cap.
+// Zero values mean "no limit". LineStart/LineEnd are 1-indexed inclusive.
+type FileGetOptions struct {
+	LineStart int    // 0 = from first line
+	LineEnd   int    // 0 = to EOF
+	MaxBytes  int64  // 0 = unlimited
+}
+
+// FileGetResult holds the outcome of a download.
+type FileGetResult struct {
+	Sha256    string
+	Truncated bool // agent stopped before EOF (hit MaxBytes or LineEnd)
+}
+
+// FileGet downloads a remote file (or a slice of it), writing content to w.
+// opts may restrict the read to a line range or byte cap — the agent honors
+// these server-side, so only the requested bytes travel over the wire.
+func (s *Session) FileGet(remotePath, cwd string, w io.Writer, opts FileGetOptions) (FileGetResult, error) {
 	id := fileID()
-	if err := s.send(&protocol.Request{ID: id, Type: "file_get", Path: remotePath, Cwd: cwd}); err != nil {
-		return "", err
+	req := &protocol.Request{
+		ID: id, Type: "file_get", Scope: "host", Path: remotePath, Cwd: cwd,
+		LineStart: opts.LineStart, LineEnd: opts.LineEnd, MaxBytes: opts.MaxBytes,
+	}
+	if err := s.send(req); err != nil {
+		return FileGetResult{}, err
 	}
 	h := sha256.New()
 	mw := io.MultiWriter(w, h)
-	var agentSha string
+	var res FileGetResult
 	for {
 		f, err := s.readFrame()
 		if err != nil {
-			return "", err
+			return res, err
 		}
 		switch f.Kind {
 		case protocol.KindFileChunk:
@@ -134,19 +154,23 @@ func (s *session) FileGet(remotePath, cwd string, w io.Writer) (string, error) {
 				mw.Write(c.Data)
 			}
 			if c.Done {
-				agentSha = c.Sha256
+				res.Sha256 = c.Sha256
+				res.Truncated = c.Truncated
 			}
 		case protocol.KindResult:
-			// Transfer complete.
+			// Transfer complete. Note: we DON'T verify sha256 when truncated,
+			// because the agent's hash covers only what it sent (a prefix or
+			// line slice), which is exactly what we received — so it still
+			// matches. Verify only when both sides have the full file.
 			localSha := hex.EncodeToString(h.Sum(nil))
-			if agentSha != "" && agentSha != localSha {
-				return "", fmt.Errorf("sha256 mismatch on download: agent %s != local %s", agentSha, localSha)
+			if res.Sha256 != "" && res.Sha256 != localSha && !res.Truncated {
+				return res, fmt.Errorf("sha256 mismatch on download: agent %s != local %s", res.Sha256, localSha)
 			}
-			return agentSha, nil
+			return res, nil
 		case protocol.KindError:
 			var e protocol.Error
 			json.Unmarshal(f.Body, &e)
-			return "", errors.New(e.Reason)
+			return res, errors.New(e.Reason)
 		}
 	}
 }
@@ -157,11 +181,12 @@ func (s *session) FileGet(remotePath, cwd string, w io.Writer) (string, error) {
 // mtime (unix seconds, 0 to skip) is set on the remote file after write so
 // sync's mtime+size check skips it next time. Reads from the file, streams in
 // chunks, sends sha256 + done.
-func (s *session) FilePut(localPath, remotePath, cwd string, mode os.FileMode, atomic bool, mtime int64) error {
+func (s *Session) FilePut(localPath, remotePath, cwd string, mode os.FileMode, atomic bool, mtime int64) error {
 	id := fileID()
 	req := &protocol.Request{
 		ID:        id,
 		Type:      "file_put",
+		Scope:     "host",
 		Path:      remotePath,
 		Cwd:       cwd,
 		Mode:      int(mode),
@@ -265,17 +290,17 @@ func CP(src, dst PathSpec) error {
 	}
 	// Download: remote -> local.
 	if src.IsRemote() {
-		sess, err := newSession(src.Host)
+		sess, err := NewSession(src.Host)
 		if err != nil {
 			return err
 		}
-		defer sess.close()
+		defer sess.Close()
 		out, err := os.Create(dst.Path)
 		if err != nil {
 			return err
 		}
 		defer out.Close()
-		_, err = sess.FileGet(src.Path, "", out)
+		_, err = sess.FileGet(src.Path, "", out, FileGetOptions{})
 		return err
 	}
 	// Upload: local -> remote.
@@ -286,11 +311,11 @@ func CP(src, dst PathSpec) error {
 	if st.IsDir() {
 		return fmt.Errorf("%s is a directory; use rsb sync for directories", src.Path)
 	}
-	sess, err := newSession(dst.Host)
+	sess, err := NewSession(dst.Host)
 	if err != nil {
 		return err
 	}
-	defer sess.close()
+	defer sess.Close()
 	return sess.FilePut(src.Path, dst.Path, "", st.Mode(), true, st.ModTime().Unix())
 }
 
@@ -312,11 +337,11 @@ func Sync(srcDir string, dst PathSpec, dryRun bool) (*SyncResult, error) {
 		return nil, fmt.Errorf("sync destination must be remote (host:path)")
 	}
 	res := &SyncResult{Failed: map[string]error{}}
-	sess, err := newSession(dst.Host)
+	sess, err := NewSession(dst.Host)
 	if err != nil {
 		return nil, err
 	}
-	defer sess.close()
+	defer sess.Close()
 
 	// Walk the local source dir. For each file, decide transfer vs skip.
 	err = filepath.Walk(srcDir, func(localPath string, info os.FileInfo, err error) error {

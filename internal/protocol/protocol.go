@@ -84,15 +84,40 @@ type Request struct {
 	Container string            `json:"container,omitempty"`
 	Session   string            `json:"session,omitempty"`
 
+	// Scope classifies the request's failover semantics (learned from Warp's
+	// HostScoped/SessionScoped/Notification split):
+	//   "session" (default): must be answered on the connection that received
+	//     it. Used by exec (streaming output binds to one connection). Cannot
+	//     be transparently retried on a rebuilt connection.
+	//   "host": host-level, can be answered on any connection to that host.
+	//     file_stat/file_get/file_put are host-scoped — if the daemon rebuilds
+	//     a dead connection, these can be retried on the new one.
+	//   "notification": fire-and-forget, no response expected. cancel/end_stdin
+	//     have this semantic (the agent acts but doesn't reply per-frame).
+	// Omit for backward compat (= "session").
+	Scope string `json:"scope,omitempty"`
+
 	// File ops (Type = file_*). Path is relative to Cwd if not absolute.
 	// For file_put, Mode is the desired file mode (e.g. 0644); 0 = inherit.
 	// Mtime (unix seconds) lets sync set the remote file's mtime to match the
 	// local source so the next sync's mtime+size check skips it.
 	// AtomicPut requests the agent write to a temp file then rename.
+	//
+	// For file_get (read-side limits, learned from Warp's ReadFileContext):
+	//   MaxBytes  — hard byte cap; agent stops reading and sets Truncated in
+	//               the final FileChunk. Prevents a 10GB log from OOMing the
+	//               daemon. 0 = unlimited.
+	//   LineStart — 1-indexed first line to read (inclusive). 0 = from start.
+	//   LineEnd   — 1-indexed last line to read (inclusive). 0 = to EOF.
+	// Line ranges let an agent read just the head of a big log/config without
+	// transferring the whole file.
 	Path       string `json:"path,omitempty"`
 	Mode       int    `json:"mode,omitempty"`
 	Mtime      int64  `json:"mtime,omitempty"`
 	AtomicPut  bool   `json:"atomic_put,omitempty"`
+	MaxBytes   int64  `json:"max_bytes,omitempty"`
+	LineStart  int    `json:"line_start,omitempty"`
+	LineEnd    int    `json:"line_end,omitempty"`
 
 	// StdinClosed indicates the client promises no Stdin frames will follow
 	// and the process should get EOF on stdin immediately. Equivalent to the
@@ -161,10 +186,11 @@ const ProtocolVersion = 2
 // Done=true and (optionally) Sha256 so the receiver can verify integrity.
 // Data is base64 over the wire (json []byte encoding), so binary-safe.
 type FileChunk struct {
-	ID     string `json:"id"`
-	Data   []byte `json:"data"`
-	Done   bool   `json:"done,omitempty"`
-	Sha256 string `json:"sha256,omitempty"`
+	ID        string `json:"id"`
+	Data      []byte `json:"data"`
+	Done      bool   `json:"done,omitempty"`
+	Sha256    string `json:"sha256,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"` // hit MaxBytes/LineEnd before EOF
 }
 
 // FileStat is the agent's reply to a file_stat request: the remote file's

@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -96,6 +97,12 @@ func main() {
 			return
 		}
 		cmdAgentVersion(os.Args[2:])
+	case "cat":
+		if wantsHelp(os.Args[2:]) {
+			helpCat()
+			return
+		}
+		cmdCat(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Printf("rsb %s (protocol v%d)\n", version, protocol.ProtocolVersion)
 	default:
@@ -135,6 +142,7 @@ COMMANDS
   exec <host> --argv '<json>'   Execute a command (argv array, no shell)
   exec <host> -- cmd args       ...or the ergonomic -- shorthand
   cp <src> <dst>                Copy a file local<->remote (host:path)
+  cat <host:path>               Read a remote file (or slice) to stdout
   sync <dir> <host:dir>         Incrementally upload a directory
   repl <host>                   Interactive multi-command session
   ensure <host> [--force]       Install/upgrade rsb-agent on a remote host
@@ -362,6 +370,133 @@ func cmdSync(args []string) {
 	if len(res.Failed) > 0 {
 		os.Exit(1)
 	}
+}
+
+// cmdCat: rsb cat <host:path> [--lines N[:M]] [--max-bytes N]
+// Reads a remote file (or a slice of it) and prints to stdout. The line range
+// and byte cap are enforced SERVER-SIDE, so only the requested bytes travel
+// over the wire — a huge bandwidth saver vs. cp-then-trim. This is rsb's
+// answer to Warp's ReadFileContext.
+func cmdCat(args []string) {
+	var linesFlag, maxBytesFlag string
+	var positional []string
+	for _, a := range args {
+		switch {
+		case strings.HasPrefix(a, "--lines="):
+			linesFlag = strings.TrimPrefix(a, "--lines=")
+		case strings.HasPrefix(a, "--max-bytes="):
+			maxBytesFlag = strings.TrimPrefix(a, "--max-bytes=")
+		default:
+			positional = append(positional, a)
+		}
+	}
+	if len(positional) < 1 {
+		fatalf("usage: rsb cat <host:path> [--lines N[:M]] [--max-bytes N]")
+	}
+	spec := client.ParsePath(positional[0])
+	if !spec.IsRemote() {
+		// Local: just read the file directly (no daemon round-trip needed).
+		f, err := os.Open(spec.Path)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		defer f.Close()
+		applyCatLimits(os.Stdout, f, linesFlag, maxBytesFlag)
+		return
+	}
+	opts := client.FileGetOptions{}
+	if linesFlag != "" {
+		start, end := parseLineRange(linesFlag)
+		opts.LineStart = start
+		opts.LineEnd = end
+	}
+	if maxBytesFlag != "" {
+		n, err := strconv.ParseInt(maxBytesFlag, 10, 64)
+		if err != nil {
+			fatalf("bad --max-bytes: %v", err)
+		}
+		opts.MaxBytes = n
+	}
+	sess, err := client.NewSession(spec.Host)
+	if err != nil {
+		fatalf("%v", err)
+	}
+	defer sess.Close()
+	res, err := sess.FileGet(spec.Path, "", os.Stdout, opts)
+	if err != nil {
+		fatalf("%v", err)
+	}
+	if res.Truncated {
+		fmt.Fprintf(os.Stderr, "rsb: (truncated — use --lines/--max-bytes to read more)\n")
+	}
+}
+
+// parseLineRange parses "N" (line N only) or "N:M" (lines N to M inclusive).
+func parseLineRange(s string) (start, end int) {
+	if i := strings.IndexByte(s, ':'); i >= 0 {
+		start, _ = strconv.Atoi(s[:i])
+		end, _ = strconv.Atoi(s[i+1:])
+		return start, end
+	}
+	n, _ := strconv.Atoi(s)
+	return n, n
+}
+
+// applyCatLimits reads from r with optional line/byte limits, writing to w.
+// Used for the local-file path of `rsb cat` (no daemon involved).
+func applyCatLimits(w io.Writer, r io.Reader, linesFlag, maxBytesFlag string) {
+	start, end := 0, 0
+	if linesFlag != "" {
+		start, end = parseLineRange(linesFlag)
+	}
+	var maxBytes int64
+	if maxBytesFlag != "" {
+		maxBytes, _ = strconv.ParseInt(maxBytesFlag, 10, 64)
+	}
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	lineNo := 0
+	var total int64
+	for sc.Scan() {
+		lineNo++
+		if start > 0 && lineNo < start {
+			continue
+		}
+		if end > 0 && lineNo > end {
+			break
+		}
+		line := sc.Bytes()
+		out := append(line, '\n')
+		if maxBytes > 0 && total+int64(len(out)) > maxBytes {
+			fmt.Fprintf(os.Stderr, "rsb: (truncated at --max-bytes)\n")
+			return
+		}
+		total += int64(len(out))
+		w.Write(out)
+	}
+}
+
+func helpCat() {
+	fmt.Print(`rsb cat - read a remote file (or a slice of it) to stdout
+
+USAGE
+  rsb cat <host:path> [--lines N[:M]] [--max-bytes BYTES]
+  rsb cat <local-path> [--lines N[:M]] [--max-bytes BYTES]
+
+Line ranges and byte caps are enforced on the REMOTE side: only the requested
+bytes travel over the wire. Ideal for peeking at the head of a large log or
+reading a config section without downloading the whole file.
+
+OPTIONS
+  --lines N       read only line N (1-indexed)
+  --lines N:M     read lines N through M (inclusive)
+  --max-bytes N   stop after N bytes (prevents OOM on huge files)
+
+EXAMPLES
+  rsb cat prod:/var/log/app.log --lines 1:100      # first 100 lines
+  rsb cat prod:/etc/nginx/nginx.conf --lines 50    # just line 50
+  rsb cat prod:/var/log/app.log --max-bytes 4096   # first 4KB
+`)
 }
 
 func helpCp() {
@@ -666,7 +801,7 @@ func cmdEnsure(args []string) {
 		if err := cmd.Run(); err != nil {
 			// Clean up the temp file so the next run isn't confused by it.
 			exec.Command("ssh", host, "rm -f "+tmpRemote).Run()
-			fatalf("%s: %v", c[0], err)
+			ensureFail(host, "%s: %v", c[0], err)
 		}
 	}
 
@@ -675,16 +810,31 @@ func cmdEnsure(args []string) {
 	// binaries, and any silent failure that "looked" successful.
 	remoteHash, ok := remoteSHA256(host, remotePath)
 	if !ok {
-		fatalf("installed but could not hash remote agent — verification FAILED\n"+
+		ensureFail(host, "installed but could not hash remote agent — verification FAILED\n"+
 			"the agent may be corrupt; retry: rsb ensure %s --force", host)
 	}
 	if remoteHash != localHash {
-		fatalf("verification FAILED: remote agent sha256 mismatch\n"+
+		ensureFail(host, "verification FAILED: remote agent sha256 mismatch\n"+
 			"  local:  %s\n  remote: %s\n"+
 			"the remote agent is NOT what we uploaded. retry: rsb ensure %s --force",
 			localHash, remoteHash, host)
 	}
 	fmt.Fprintf(os.Stderr, "rsb: %s ready (verified sha256 %.12s)\n", host, localHash)
+}
+
+// ensureFail reports an ensure failure WITH a downgrade hint, so the user
+// isn't stuck. Even without a working agent, rsb exec still works for raw
+// commands (including manual `docker exec`), and rsb cp/sync fall back to
+// scp. Borrowed from Warp's "Failed → fallback" state-machine philosophy:
+// don't hard-stop, give a path forward.
+func ensureFail(host, format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "rsb: "+format+"\n\n", args...)
+	fmt.Fprintf(os.Stderr, "rsb: downgrade options while agent is unavailable:\n")
+	fmt.Fprintf(os.Stderr, "  - exec raw commands:    rsb exec %s -- <cmd>\n", host)
+	fmt.Fprintf(os.Stderr, "  - manual container:     rsb exec %s -- docker exec <container> <cmd>\n", host)
+	fmt.Fprintf(os.Stderr, "  - file transfer:        use scp until agent is fixed\n")
+	fmt.Fprintf(os.Stderr, "  - retry install:        rsb ensure %s --force\n", host)
+	os.Exit(1)
 }
 
 // sha256File returns the hex sha256 of a local file.

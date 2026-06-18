@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -94,26 +95,92 @@ func (a *agent) handleFileGet(req protocol.Request) {
 	defer f.Close()
 
 	h := sha256.New()
-	buf := make([]byte, chunkSize)
-	for {
-		n, rerr := f.Read(buf)
-		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			h.Write(chunk)
-			a.writeFrame(protocol.KindFileChunk, protocol.FileChunk{ID: req.ID, Data: chunk})
+	truncated := false
+
+	switch {
+	// Line-range read: use a scanner to emit only the requested lines. This
+	// is the "agent reads the head of a big log" path — huge bandwidth saver
+	// vs. transferring the whole file then trimming client-side.
+	case req.LineStart > 0 || req.LineEnd > 0:
+		start := req.LineStart
+		if start == 0 {
+			start = 1
 		}
-		if rerr != nil {
-			if !errors.Is(rerr, io.EOF) {
-				a.writeFrame(protocol.KindError, protocol.Error{ID: req.ID, Reason: "read: " + rerr.Error()})
-				return
+		end := req.LineEnd // 0 = unlimited
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024) // 1MB max line
+		lineNo := 0
+		var total int64
+		for scanner.Scan() {
+			lineNo++
+			if lineNo < start {
+				continue
 			}
-			break
+			if end > 0 && lineNo > end {
+				// Reached the requested line end — NOT truncation. We read
+				// exactly what was asked; only a MaxBytes cutoff mid-read counts.
+				break
+			}
+			line := scanner.Bytes()
+			// Add newline (Scanner strips it). Preserve original line endings
+			// is overkill for the log-reading use case; normalize to \n.
+			out := make([]byte, 0, len(line)+1)
+			out = append(out, line...)
+			out = append(out, '\n')
+			// Honor MaxBytes even in line mode.
+			if req.MaxBytes > 0 && total+int64(len(out)) > req.MaxBytes {
+				truncated = true
+				break
+			}
+			total += int64(len(out))
+			h.Write(out)
+			a.writeFrame(protocol.KindFileChunk, protocol.FileChunk{ID: req.ID, Data: out})
+		}
+		if err := scanner.Err(); err != nil {
+			a.writeFrame(protocol.KindError, protocol.Error{ID: req.ID, Reason: "scan: " + err.Error()})
+			return
+		}
+
+	// Whole-file read with optional byte cap. The default path; MaxBytes
+	// protects against OOM on huge files (learned from Warp's byte budget).
+	default:
+		buf := make([]byte, chunkSize)
+		var total int64
+		for {
+			// If we're under a byte cap, shrink the next read to not overshoot.
+			toRead := len(buf)
+			if req.MaxBytes > 0 {
+				remaining := req.MaxBytes - total
+				if remaining <= 0 {
+					truncated = true
+					break
+				}
+				if remaining < int64(toRead) {
+					toRead = int(remaining)
+				}
+			}
+			n, rerr := f.Read(buf[:toRead])
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				h.Write(chunk)
+				total += int64(n)
+				a.writeFrame(protocol.KindFileChunk, protocol.FileChunk{ID: req.ID, Data: chunk})
+			}
+			if rerr != nil {
+				if !errors.Is(rerr, io.EOF) {
+					a.writeFrame(protocol.KindError, protocol.Error{ID: req.ID, Reason: "read: " + rerr.Error()})
+					return
+				}
+				break
+			}
 		}
 	}
-	// Final chunk: empty data, Done=true, Sha256 of everything we sent.
+
+	// Final chunk: Done + Truncated flag + sha256 of what we actually sent.
 	a.writeFrame(protocol.KindFileChunk, protocol.FileChunk{
-		ID: req.ID, Done: true, Sha256: hex.EncodeToString(h.Sum(nil)),
+		ID: req.ID, Done: true, Truncated: truncated,
+		Sha256: hex.EncodeToString(h.Sum(nil)),
 	})
 	a.writeFrame(protocol.KindResult, protocol.Result{ID: req.ID, ExitCode: 0})
 }

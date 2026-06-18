@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"rsb/internal/paths"
 	"rsb/internal/protocol"
@@ -35,9 +36,10 @@ const localHost = "local"
 
 // Daemon holds the listener and the per-host connection pool.
 type Daemon struct {
-	mu    sync.Mutex
-	conns map[string]*hostConn // host -> persistent connection to that host's agent
-	ln    net.Listener
+	mu       sync.Mutex
+	conns    map[string]*hostConn // host -> persistent connection to that host's agent
+	ln       net.Listener
+	clients  sync.WaitGroup // tracks active serveClient goroutines for graceful shutdown
 }
 
 // New creates a daemon listening on the unix socket. It removes any stale
@@ -68,13 +70,35 @@ func (d *Daemon) Serve() {
 			log.Printf("accept: %v", err)
 			continue
 		}
-		go d.serveClient(conn)
+		d.clients.Add(1)
+		go func() {
+			defer d.clients.Done()
+			d.serveClient(conn)
+		}()
 	}
 }
 
-// Close stops accepting and drops all host connections.
+// Close stops accepting new connections, waits for in-flight client sessions
+// to finish (bounded by a timeout so a stuck client can't hang shutdown),
+// then drops all host connections. This is the graceful-shutdown path: a
+// plain SIGKILL would drop in-flight transfers mid-stream.
 func (d *Daemon) Close() error {
-	d.ln.Close()
+	d.ln.Close() // stop accepting; Serve's Accept loop exits
+
+	// Wait for active client sessions with a deadline. A client stuck on a
+	// dead host connection (no inactivity timeout of its own) would otherwise
+	// block shutdown forever. 10s is generous for clean in-flight ops.
+	done := make(chan struct{})
+	go func() {
+		d.clients.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		log.Printf("daemon: shutdown timeout, forcing close with %d client(s) still active", countActive(&d.clients))
+	}
+
 	d.mu.Lock()
 	for _, hc := range d.conns {
 		hc.close()
@@ -82,6 +106,13 @@ func (d *Daemon) Close() error {
 	d.conns = make(map[string]*hostConn)
 	d.mu.Unlock()
 	return nil
+}
+
+// countActive is a helper for the shutdown-timeout log; WaitGroup doesn't
+// expose its counter directly, so we approximate (0 if Done channel closed).
+func countActive(wg *sync.WaitGroup) int {
+	// We can't read the counter; return a sentinel. The log is informational.
+	return -1
 }
 
 // ---- client handling ----

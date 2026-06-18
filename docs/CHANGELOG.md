@@ -5,6 +5,24 @@
 
 ---
 
+## [0.7.0] - 2026-06-18
+
+借鉴 Warp 开源实现后的韧性 + 可读性增强。
+
+### 新增
+- **`rsb cat <host:path>`**：读远端文件（或切片）到 stdout，**行范围和字节上限在远端执行**——只传请求的字节，不传整个文件。对标 Warp 的 ReadFileContext。适合 agent 看大日志/配置的头部。
+  - `rsb cat prod:/var/log/app.log --lines=1:100`（前 100 行）
+  - `rsb cat prod:/etc/nginx/nginx.conf --lines=50`（单行）
+  - `rsb cat prod:/var/log/app.log --max-bytes=4096`（前 4KB，防 OOM）
+- **Request 加 `Scope` 语义**：区分 `host`（可故障转移到新连接，file 操作用这个）vs `session`（必须原连接响应，exec 用这个）。借鉴 Warp 的 HostScoped/SessionScoped 分层，为未来订阅类操作铺路。
+- **file_get 加 `MaxBytes`/`LineStart`/`LineEnd`**：agent 端按需读取，FileChunk 加 `Truncated` 标志。
+
+### 改进
+- **daemon 优雅关闭**：`rsb daemon stop` 现在等在途 client 会话完成（带 10s 超时兜底）再关 host 连接，而非粗暴 kill。借鉴 Warp 的 `ssh -O exit` 思路。
+- **ensure 失败提示降级路径**：安装/校验失败时不再硬停，列出可行的 workaround（argv 手动执行、scp 传文件、ensure --force 重试）。借鉴 Warp 的 "Failed → fallback" 状态机哲学。
+
+---
+
 ## [0.6.0] - 2026-06-18
 
 文件传输 + argv 简写 + compose 适配。把 rsb 从"远程执行工具"升级为"远程维护工具"。
